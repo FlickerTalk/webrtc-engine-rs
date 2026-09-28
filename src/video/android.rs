@@ -25,9 +25,10 @@
 //! rotation needs a new decoder, so it waits for the next keyframe and, meanwhile, the sink asks
 //! for one. [`DisplaySink::video_size`] gives the upright size for the view's aspect ratio.
 //!
-//! **Keyframe signal**: [`DisplaySink::keyframe_request`] gives a [`KeyframeRequest`] the
-//! pipeline polls; while [`KeyframeRequest::is_needed`] is `true` it sends PLIs (rate limited on
-//! its side). It turns on before the first keyframe, after a frame is lost (no free input
+//! **Keyframe signal**: `VideoCall` polls the sink's
+//! [`VideoSink::keyframe_needed`](super::VideoSink::keyframe_needed), the same flag as
+//! [`KeyframeRequest::is_needed`] (from [`DisplaySink::keyframe_request`]); while it is `true`
+//! the call sends PLIs, rate limited. It turns on before the first keyframe, after a frame is lost (no free input
 //! buffer), after a decoder error (the decoder is rebuilt at the next keyframe), after a surface
 //! change the decoder could not follow, and while a rotation change waits; the next keyframe
 //! turns it off. Decoder errors never fail [`VideoSink::push`](super::VideoSink::push).
@@ -61,8 +62,8 @@
 //! 3. uses `SurfaceView`s: the preview gets the camera's own transform (upright and mirrored for
 //!    the front camera), and the remote video the decoder's rotation; nothing else to do;
 //! 4. calls [`CameraSource::set_display_rotation`] when the activity turns (not needed for a
-//!    portrait-only screen), and restarts the source if [`CameraSource::camera_lost`] (another
-//!    app took the camera);
+//!    portrait-only screen). A lost camera ([`CameraSource::camera_lost`], another app took it)
+//!    is started again by `VideoCall`, which polls it through `VideoSource::lost`;
 //! 5. for video in the background, runs the foreground service of type `camera`.
 //!
 //! The process needs binder threads for the camera to fill surfaces whose queue lives in it (the
@@ -2232,6 +2233,11 @@ mod device {
             running.encoder.request_keyframe();
             Ok(())
         }
+
+        /// [`CameraSource::camera_lost`]: the engine starts the source again when it sees it.
+        fn lost(&self) -> bool {
+            self.camera_lost()
+        }
     }
 
     impl Drop for CameraSource {
@@ -2612,6 +2618,11 @@ mod device {
             self.keyframe.set(false);
             self.running = false;
             Ok(())
+        }
+
+        /// [`KeyframeRequest::is_needed`]: a level, `true` until a keyframe is decoded.
+        fn keyframe_needed(&mut self) -> bool {
+            self.keyframe.is_needed()
         }
     }
 }
@@ -3495,11 +3506,14 @@ mod tests {
                 timestamp: Duration::ZERO,
                 rotation: Rotation::Deg0,
             };
+            assert!(VideoSink::keyframe_needed(&mut sink), "nothing decoded yet");
             sink.push(keyframe).unwrap();
             assert!(!sink.keyframe_needed());
             // Without a surface the decoder renders nowhere; the request is the point here.
             sink.push(delta(Rotation::Deg90)).unwrap();
             assert!(sink.keyframe_needed(), "a turn asks for a keyframe");
+            // What the engine polls, through the contract.
+            assert!(VideoSink::keyframe_needed(&mut sink));
             sink.stop().unwrap();
             assert!(!sink.keyframe_needed());
         }
@@ -3554,6 +3568,7 @@ mod tests {
             unsafe { source.set_preview_surface(None) }.unwrap();
             sleep(Duration::from_millis(500));
             assert!(!source.camera_lost());
+            assert!(!VideoSource::lost(&source), "the engine sees the same");
             source.stop().unwrap();
             assert!(front_frames.first().is_some_and(|frame| frame.keyframe));
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
