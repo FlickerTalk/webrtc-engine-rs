@@ -47,6 +47,7 @@
 //!   and the desktop.
 
 pub mod h264;
+pub mod packet;
 
 use std::fmt;
 use std::sync::Arc;
