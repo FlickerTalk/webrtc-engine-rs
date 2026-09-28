@@ -18,7 +18,7 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 
 | Módulo   | Qué hace |
 | -------- | -------- |
-| `audio`  | Anillos SPSC sin bloqueos ni asignaciones entre los callbacks del dispositivo y el motor; adaptadores (mezcla a mono, remuestreo lineal, i16/f32, silencio y cuenta de vacíos); trait `AudioBackend`; `audio::desktop` con cpal (feature `desktop`, desactivada por defecto). |
+| `audio`  | Anillos SPSC sin bloqueos ni asignaciones entre los callbacks del dispositivo y el motor; adaptadores (mezcla a mono, remuestreo lineal, i16/f32, silencio y cuenta de vacíos); trait `AudioBackend`; `audio::desktop` con cpal (feature `desktop`, desactivada por defecto); `audio::android` con AAudio (`AaudioBackend`, solo Android). |
 | `codec`  | Opus con libopus 1.6.1 vendorizada en `vendor/opus` y compilada con `cc` (`build.rs`, sin cmake). VoIP, 32 kbit/s, FEC en banda, 10 % de pérdida esperada, DTX apagado. `decode`, `conceal` (PLC), `recover` (FEC del paquete siguiente). |
 | `rtp`    | Opus sobre pistas de webrtc-rs 0.21 (API sans-IO + crate `rtc`): `media_engine`, `peer_connection_builder`, `add_audio_track` → `AudioSender`, `AudioReceiver`. El payload type negociado se lee en cada envío. |
 | `jitter` | `JitterBuffer`: reordena por secuencia (con el salto de 65535 a 0), profundidad adaptativa de 1 a 10 tramas según el jitter RFC 3550 medido con `push_at`; `playout()` → `Frame` / `Missing` / `Waiting`; `peek_next` para la FEC. |
@@ -50,6 +50,35 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 - **`RemoteAudio`**: webrtc-rs anuncia la pista remota (`on_track`) al llegar su primer paquete
   RTP, o sea, después de empezar a enviar. La llamada arranca con `RemoteAudio` y su primer
   `recv` espera la pista por un `oneshot`.
+
+### El backend de Android (`audio::android`)
+
+- **`AaudioBackend::new()`** carga AAudio; implementa `AudioBackend` (`start(DeviceIo)`, `stop`) y
+  es `Send`. Además: `voice_processing()`, `session_id()`, `capture_dropped()`,
+  `playout_underruns()`, `stream_errors()` y `restart_if_needed()`.
+- **Flujos**: los dos compartidos y de baja latencia, pidiendo 48 kHz mono i16; se lee lo que
+  concede AAudio y los adaptadores convierten el resto (i16 o float, cualquier frecuencia y
+  canales). Entrada con el preset `VOICE_COMMUNICATION` (AEC y supresión de ruido de la
+  plataforma); salida con uso `VOICE_COMMUNICATION` y contenido voz, búfer de dos ráfagas. La
+  entrada abre con una sesión nueva (`AAUDIO_SESSION_ID_ALLOCATE`) y la salida se une a esa
+  sesión para que el AEC las empareje. Con sesión no hay MMAP: algo más de latencia.
+- **AAudio se carga con `dlopen`, no se enlaza**: la app tiene minSdk 24 y AAudio llega con la
+  API 26; enlazar `libaaudio.so` impediría cargar la biblioteca nativa entera en Android 7. En la
+  API 24–25 `new()` devuelve `AudioError`. En la 26–27 no hay presets, uso ni sesiones: la llamada
+  funciona sin el procesado de voz de la plataforma y `voice_processing()` devuelve `false`.
+- **Tiempo real**: los callbacks de datos solo mueven muestras entre el búfer de AAudio y los
+  anillos a través de los adaptadores (sin bloqueos ni asignaciones). El callback de error
+  (dispositivo desconectado, auriculares que se enchufan o desenchufan) solo cuenta y levanta una
+  bandera: AAudio prohíbe cerrar el flujo desde él. **Quien tenga el backend llama a
+  `restart_if_needed()` cada ~100 ms**: cierra los dos flujos y los reabre sobre los mismos
+  anillos; si falla, se queda con los anillos y lo reintenta en la siguiente llamada.
+- **Parada**: `stop` y `Drop` paran y cierran los dos flujos antes de soltar los adaptadores y
+  los anillos (el `Drop` de cada flujo cierra primero y libera su estado después).
+- **Contrato con Kotlin** (la app): antes de que Rust llame a `start`, Kotlin **tiene el permiso
+  `RECORD_AUDIO`** (sin él, `start` falla al abrir la entrada), **pone
+  `AudioManager.mode = MODE_IN_COMMUNICATION`** (y la ruta: auricular, altavoz, cascos) y, para
+  seguir en segundo plano, mantiene el servicio en primer plano de tipo `microphone`. El modo se
+  restaura después de `stop`. Rust no toca el framework de Android.
 
 ## Decisiones y por qué
 
@@ -85,12 +114,20 @@ cargo run --example mic_echo --features desktop    # solo dispositivos, 200 ms d
 # iOS
 IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --target aarch64-apple-ios
 
-# Android
+# Android (mismas variables del NDK para build, clippy y tests)
 NDK_BIN=~/Library/Android/sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/darwin-x86_64/bin
 CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android24-clang \
 AR_aarch64_linux_android=$NDK_BIN/llvm-ar \
 CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android24-clang \
 cargo build --target aarch64-linux-android
+cargo clippy --target aarch64-linux-android --all-targets -- -D warnings
+
+# Pruebas de audio en un Android por adb (solo si Ioan lo pide; se borra el binario al acabar).
+# Desde el usuario shell se abren también la entrada (el shell tiene RECORD_AUDIO).
+cargo test --target aarch64-linux-android --lib --no-run   # imprime la ruta del binario
+adb push target/aarch64-linux-android/debug/deps/webrtc_engine-<hash> /data/local/tmp/wee-tests
+adb shell "cd /data/local/tmp && ./wee-tests audio::android --include-ignored --test-threads=1 --nocapture"
+adb shell rm /data/local/tmp/wee-tests
 ```
 
 Las pruebas de `build.rs` no las ejecuta Cargo; el comando está en el propio `build.rs`.
@@ -121,7 +158,9 @@ ALSA). Sin secretos.
 ## Pendiente
 
 - **Backend iOS**: VoiceProcessingIO (cancelación de eco) y la sesión de audio de CallKit.
-- **Backend Android**: AAudio con `VOICE_COMMUNICATION` (y el AEC de la plataforma).
+- **Android, integración**: llamar a `restart_if_needed()` periódicamente desde quien tenga el
+  backend; probar una desconexión real (enchufar cascos o Bluetooth en plena llamada), Android
+  8.x (sin preset) y más teléfonos; comprobar el AEC en una llamada real.
 - **Integración en la app de FlickerTalk** (`app/`): sustituir el audio del WebView en las
   llamadas; señalización y ciclo de vida de la llamada.
 - **DTX y marcas de tiempo RTP en el jitter buffer**: hoy supone 20 ms por secuencia; con DTX los
@@ -147,4 +186,9 @@ constantes unificadas en la raíz del crate y `Cargo.lock` versionado. Hecho enc
   una `Call` sobre el enlace simulado; y voz en los dos sentidos por una llamada webrtc-rs real en
   loopback (correlación ~0,97, ~86 ms).
 - Demo `call_demo` (feature `desktop`) para oírlo en el Mac; compila, falta que Ioan la escuche.
+- `audio::android` (rama `android-backend`): `AaudioBackend` sobre AAudio cargado con `dlopen`.
+  Probado en la tableta Lenovo TB361FU (Android 16, API 36): salida y entrada concedidas a
+  48 kHz mono i16, AudioFlinger crea el AEC y la supresión de ruido en la sesión compartida, la
+  reapertura tras un error funciona y la batería completa de tests de la biblioteca pasa en el
+  dispositivo.
 - CI en `.github/workflows/ci.yml`.
