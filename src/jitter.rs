@@ -169,6 +169,7 @@ impl JitterBuffer {
         self.next = None;
         self.highest = None;
         self.playing = false;
+        self.estimate.last_transit_ms = None;
     }
 
     fn extend(&mut self, sequence: u16) -> i64 {
@@ -446,5 +447,18 @@ mod tests {
         assert_jitter_ms(&buffer, 0.625);
         buffer.push_at(4, vec![4], at(1080));
         assert_jitter_ms(&buffer, 1.2109375);
+    }
+
+    // After a resync the sequences belong to a new stream: comparing them with the old one
+    // would read the jump as a huge delay.
+    #[test]
+    fn a_restart_is_not_jitter() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push_at(1, vec![1], at(1000));
+        buffer.push_at(2, vec![2], at(1020));
+        buffer.push_at(5000, vec![50], at(1040));
+        buffer.push_at(5001, vec![51], at(1060));
+        buffer.push_at(5002, vec![52], at(1080));
+        assert_jitter_ms(&buffer, 0.0);
     }
 }
