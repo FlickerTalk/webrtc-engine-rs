@@ -7,6 +7,7 @@ pub(crate) const START_CODE: [u8; 4] = [0, 0, 0, 1];
 /// NAL unit types (ITU-T H.264, table 7-1) this module cares about.
 pub(crate) const NAL_SLICE: u8 = 1;
 pub(crate) const NAL_IDR: u8 = 5;
+#[cfg(test)]
 pub(crate) const NAL_SEI: u8 = 6;
 pub(crate) const NAL_SPS: u8 = 7;
 pub(crate) const NAL_PPS: u8 = 8;

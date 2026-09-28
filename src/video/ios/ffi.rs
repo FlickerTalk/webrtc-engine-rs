@@ -18,8 +18,6 @@ use crate::video::VideoError;
 
 /// A CoreMedia / VideoToolbox result: zero is success.
 pub(crate) type OSStatus = i32;
-/// A CoreVideo result: zero is success.
-pub(crate) type CVReturn = i32;
 pub(crate) type CFTypeRef = *const c_void;
 pub(crate) type CFAllocatorRef = *const c_void;
 pub(crate) type CFStringRef = *const c_void;
@@ -71,18 +69,12 @@ opaque!(
     OpaqueCompressionSession,
     "OpaqueVTCompressionSession"
 );
-opaque!(
-    /// What a `VTDecompressionSessionRef` points at.
-    OpaqueDecompressionSession,
-    "OpaqueVTDecompressionSession"
-);
 
 pub(crate) type CMSampleBufferRef = *mut OpaqueSampleBuffer;
 pub(crate) type CMFormatDescriptionRef = *mut OpaqueFormatDescription;
 pub(crate) type CMBlockBufferRef = *mut OpaqueBlockBuffer;
 pub(crate) type CVPixelBufferRef = *mut OpaquePixelBuffer;
 pub(crate) type VTCompressionSessionRef = *mut OpaqueCompressionSession;
-pub(crate) type VTDecompressionSessionRef = *mut OpaqueDecompressionSession;
 
 /// `CMTime`: `value / timescale` seconds.
 #[repr(C)]
@@ -131,14 +123,6 @@ pub(crate) struct CMSampleTimingInfo {
     pub decode_time_stamp: CMTime,
 }
 
-/// `CMVideoDimensions`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CMVideoDimensions {
-    pub width: i32,
-    pub height: i32,
-}
-
 /// `CGAffineTransform` (64-bit, so `CGFloat` is `f64`), for `-[CALayer setAffineTransform:]`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -175,24 +159,6 @@ pub(crate) type VTCompressionOutputCallback = unsafe extern "C" fn(
     sample_buffer: CMSampleBufferRef,
 );
 
-/// `VTDecompressionOutputCallback`.
-pub(crate) type VTDecompressionOutputCallback = unsafe extern "C" fn(
-    output_ref_con: *mut c_void,
-    source_frame_ref_con: *mut c_void,
-    status: OSStatus,
-    info_flags: u32,
-    image_buffer: CVPixelBufferRef,
-    presentation_time_stamp: CMTime,
-    presentation_duration: CMTime,
-);
-
-/// `VTDecompressionOutputCallbackRecord`.
-#[repr(C)]
-pub(crate) struct VTDecompressionOutputCallbackRecord {
-    pub callback: Option<VTDecompressionOutputCallback>,
-    pub ref_con: *mut c_void,
-}
-
 /// A function `dispatch_sync_f` runs.
 pub(crate) type DispatchFunction = unsafe extern "C" fn(context: *mut c_void);
 
@@ -218,7 +184,6 @@ unsafe extern "C" {
     pub(crate) static kCFTypeArrayCallBacks: c_void;
 
     pub(crate) fn CFRelease(object: CFTypeRef);
-    pub(crate) fn CFRetain(object: CFTypeRef) -> CFTypeRef;
     pub(crate) fn CFNumberCreate(
         allocator: CFAllocatorRef,
         number_type: CFIndex,
@@ -313,38 +278,14 @@ unsafe extern "C" {
         nal_unit_header_length: i32,
         format_description_out: *mut CMFormatDescriptionRef,
     ) -> OSStatus;
-    pub(crate) fn CMVideoFormatDescriptionGetDimensions(
-        description: CMFormatDescriptionRef,
-    ) -> CMVideoDimensions;
 }
 
 #[link(name = "CoreVideo", kind = "framework")]
 unsafe extern "C" {
     pub(crate) static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
-    pub(crate) static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
 
     pub(crate) fn CVPixelBufferGetWidth(buffer: CVPixelBufferRef) -> usize;
     pub(crate) fn CVPixelBufferGetHeight(buffer: CVPixelBufferRef) -> usize;
-    pub(crate) fn CVPixelBufferGetPixelFormatType(buffer: CVPixelBufferRef) -> u32;
-    pub(crate) fn CVPixelBufferCreate(
-        allocator: CFAllocatorRef,
-        width: usize,
-        height: usize,
-        pixel_format_type: u32,
-        attributes: CFDictionaryRef,
-        pixel_buffer_out: *mut CVPixelBufferRef,
-    ) -> CVReturn;
-    pub(crate) fn CVPixelBufferLockBaseAddress(buffer: CVPixelBufferRef, flags: u64) -> CVReturn;
-    pub(crate) fn CVPixelBufferUnlockBaseAddress(buffer: CVPixelBufferRef, flags: u64) -> CVReturn;
-    pub(crate) fn CVPixelBufferGetBaseAddressOfPlane(
-        buffer: CVPixelBufferRef,
-        plane: usize,
-    ) -> *mut c_void;
-    pub(crate) fn CVPixelBufferGetBytesPerRowOfPlane(
-        buffer: CVPixelBufferRef,
-        plane: usize,
-    ) -> usize;
-    pub(crate) fn CVPixelBufferGetHeightOfPlane(buffer: CVPixelBufferRef, plane: usize) -> usize;
 }
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -396,25 +337,6 @@ unsafe extern "C" {
     ) -> OSStatus;
     pub(crate) fn VTCompressionSessionInvalidate(session: VTCompressionSessionRef);
 
-    pub(crate) fn VTDecompressionSessionCreate(
-        allocator: CFAllocatorRef,
-        video_format_description: CMFormatDescriptionRef,
-        video_decoder_specification: CFDictionaryRef,
-        destination_image_buffer_attributes: CFDictionaryRef,
-        output_callback: *const VTDecompressionOutputCallbackRecord,
-        decompression_session_out: *mut VTDecompressionSessionRef,
-    ) -> OSStatus;
-    pub(crate) fn VTDecompressionSessionDecodeFrame(
-        session: VTDecompressionSessionRef,
-        sample_buffer: CMSampleBufferRef,
-        decode_flags: u32,
-        source_frame_ref_con: *mut c_void,
-        info_flags_out: *mut u32,
-    ) -> OSStatus;
-    pub(crate) fn VTDecompressionSessionWaitForAsynchronousFrames(
-        session: VTDecompressionSessionRef,
-    ) -> OSStatus;
-    pub(crate) fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
 }
 
 // AVFoundation and QuartzCore are reached through the Objective-C runtime (objc2); these empty
@@ -461,20 +383,6 @@ impl<T> CfOwned<T> {
     /// `ptr` is null or a CoreFoundation object with a reference the caller hands over.
     pub(crate) unsafe fn from_create(ptr: *mut T) -> Option<Self> {
         (!ptr.is_null()).then_some(Self(ptr))
-    }
-
-    /// Takes a new reference on a borrowed object; `None` if `ptr` is null.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` is null or a live CoreFoundation object.
-    pub(crate) unsafe fn retain(ptr: *mut T) -> Option<Self> {
-        if ptr.is_null() {
-            return None;
-        }
-        // SAFETY: a live object, per the caller.
-        unsafe { CFRetain(ptr.cast_const().cast()) };
-        Some(Self(ptr))
     }
 
     pub(crate) fn as_ptr(&self) -> *mut T {
@@ -616,9 +524,126 @@ pub(crate) fn check(status: OSStatus, call: &str) -> Result<(), VideoError> {
 
 const _: () = assert!(size_of::<CMTime>() == 24);
 const _: () = assert!(size_of::<CMSampleTimingInfo>() == 72);
-const _: () = assert!(size_of::<CMVideoDimensions>() == 8);
 const _: () = assert!(size_of::<CGAffineTransform>() == 48);
-const _: () = assert!(size_of::<VTDecompressionOutputCallbackRecord>() == 16);
+
+#[cfg(test)]
+pub(crate) use for_tests::*;
+
+/// Declarations only the simulator tests use: synthetic pixel buffers and a decoder to check
+/// the encoder's output.
+#[cfg(test)]
+mod for_tests {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+
+    use objc2::encode::{Encoding, RefEncode};
+
+    use super::*;
+
+    /// A CoreVideo result: zero is success.
+    pub(crate) type CVReturn = i32;
+
+    opaque!(
+        /// What a `VTDecompressionSessionRef` points at.
+        OpaqueDecompressionSession,
+        "OpaqueVTDecompressionSession"
+    );
+
+    pub(crate) type VTDecompressionSessionRef = *mut OpaqueDecompressionSession;
+
+    /// `CMVideoDimensions`.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct CMVideoDimensions {
+        pub width: i32,
+        pub height: i32,
+    }
+
+    /// `VTDecompressionOutputCallback`.
+    pub(crate) type VTDecompressionOutputCallback = unsafe extern "C" fn(
+        output_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
+        status: OSStatus,
+        info_flags: u32,
+        image_buffer: CVPixelBufferRef,
+        presentation_time_stamp: CMTime,
+        presentation_duration: CMTime,
+    );
+
+    /// `VTDecompressionOutputCallbackRecord`.
+    #[repr(C)]
+    pub(crate) struct VTDecompressionOutputCallbackRecord {
+        pub callback: Option<VTDecompressionOutputCallback>,
+        pub ref_con: *mut c_void,
+    }
+
+    #[link(name = "CoreMedia", kind = "framework")]
+    unsafe extern "C" {
+        pub(crate) fn CMVideoFormatDescriptionGetDimensions(
+            description: CMFormatDescriptionRef,
+        ) -> CMVideoDimensions;
+    }
+
+    #[link(name = "CoreVideo", kind = "framework")]
+    unsafe extern "C" {
+        pub(crate) static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
+
+        pub(crate) fn CVPixelBufferCreate(
+            allocator: CFAllocatorRef,
+            width: usize,
+            height: usize,
+            pixel_format_type: u32,
+            attributes: CFDictionaryRef,
+            pixel_buffer_out: *mut CVPixelBufferRef,
+        ) -> CVReturn;
+        pub(crate) fn CVPixelBufferLockBaseAddress(
+            buffer: CVPixelBufferRef,
+            flags: u64,
+        ) -> CVReturn;
+        pub(crate) fn CVPixelBufferUnlockBaseAddress(
+            buffer: CVPixelBufferRef,
+            flags: u64,
+        ) -> CVReturn;
+        pub(crate) fn CVPixelBufferGetBaseAddressOfPlane(
+            buffer: CVPixelBufferRef,
+            plane: usize,
+        ) -> *mut c_void;
+        pub(crate) fn CVPixelBufferGetBytesPerRowOfPlane(
+            buffer: CVPixelBufferRef,
+            plane: usize,
+        ) -> usize;
+        pub(crate) fn CVPixelBufferGetHeightOfPlane(
+            buffer: CVPixelBufferRef,
+            plane: usize,
+        ) -> usize;
+    }
+
+    #[link(name = "VideoToolbox", kind = "framework")]
+    unsafe extern "C" {
+        pub(crate) fn VTDecompressionSessionCreate(
+            allocator: CFAllocatorRef,
+            video_format_description: CMFormatDescriptionRef,
+            video_decoder_specification: CFDictionaryRef,
+            destination_image_buffer_attributes: CFDictionaryRef,
+            output_callback: *const VTDecompressionOutputCallbackRecord,
+            decompression_session_out: *mut VTDecompressionSessionRef,
+        ) -> OSStatus;
+        pub(crate) fn VTDecompressionSessionDecodeFrame(
+            session: VTDecompressionSessionRef,
+            sample_buffer: CMSampleBufferRef,
+            decode_flags: u32,
+            source_frame_ref_con: *mut c_void,
+            info_flags_out: *mut u32,
+        ) -> OSStatus;
+        pub(crate) fn VTDecompressionSessionWaitForAsynchronousFrames(
+            session: VTDecompressionSessionRef,
+        ) -> OSStatus;
+        pub(crate) fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
+    }
+
+    const _: () = assert!(size_of::<CMVideoDimensions>() == 8);
+    const _: () = assert!(size_of::<VTDecompressionOutputCallbackRecord>() == 16);
+}
 
 #[cfg(test)]
 mod tests {
