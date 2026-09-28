@@ -3,7 +3,8 @@
 Motor de medios para las llamadas de FlickerTalk sobre webrtc-rs (repo `FlickerTalk/webrtc-engine-rs`,
 AGPL-3.0-only, edición 2024). Objetivo: el audio de la llamada nativo en iOS y Android, para que
 una llamada contestada con CallKit con el iPhone bloqueado tenga audio; el WebRTC del WebView no
-puede. Primero audio; el vídeo, después. El escritorio (macOS) es para probarlo y oírlo.
+puede. Primero el audio; el vídeo ya está en el motor (H.264 con el hardware de cada teléfono),
+falta llevarlo a la app. El escritorio (macOS) es para probarlo, oírlo y verlo.
 
 ## Arquitectura
 
@@ -24,7 +25,7 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 | `jitter` | `JitterBuffer`: reordena por secuencia (con el salto de 65535 a 0), profundidad adaptativa de 1 a 10 tramas según el jitter RFC 3550 medido con `push_at`; `playout()` → `Frame` / `Missing` / `Waiting`; `peek_next` para la FEC. |
 | `call`   | La cadena. `Uplink` y `Downlink` son máquinas de estado síncronas; `Call` las ejecuta en tres tareas de Tokio (envío, recepción, reproducción). Transporte abstracto: `PacketSink` / `PacketSource`, implementados para `AudioSender`, `AudioReceiver` y `RemoteAudio`. |
 | `netsim` | `NetworkSimulator`: red simulada sans-IO y determinista con semilla (retardo, jitter uniforme, pérdida, reordenación, duplicados). `simulated_link` la usa como transporte de una `Call` con el reloj de Tokio; `simulated_video_link`, como un sentido del vídeo (tramas en paquetes RTP a la ida, peticiones de keyframe a la vuelta). |
-| `video`  | Contrato del vídeo: la plataforma captura **y** codifica (y decodifica **y** pinta) con su hardware; el núcleo solo mueve access units H.264 Annex-B (`EncodedFrame`, SPS/PPS en cada keyframe). `VideoSource`, `VideoSink`, `VideoConfig`, `Facing`, `Rotation` (viaja en la extensión RTP CVO, no se rota el píxel) y el canal `frame_channel` (acotado, sin bloqueo; tras descartar exige keyframe). Puntos de anclaje de iOS/Android/escritorio en la doc del módulo. `video::ios` (solo iOS) y `video::android` (solo Android): `CameraSource` y `DisplaySink`, ver abajo. |
+| `video`  | Contrato del vídeo: la plataforma captura **y** codifica (y decodifica **y** pinta) con su hardware; el núcleo solo mueve access units H.264 Annex-B (`EncodedFrame`, SPS/PPS en cada keyframe). `VideoSource`, `VideoSink`, `VideoConfig`, `Facing`, `Rotation` (viaja en la extensión RTP CVO, no se rota el píxel) y el canal `frame_channel` (acotado, sin bloqueo; tras descartar exige keyframe). Puntos de anclaje de iOS/Android/escritorio en la doc del módulo. `video::ios` (solo iOS) y `video::android` (solo Android): `CameraSource` y `DisplaySink`, ver abajo. `platform_source()` / `platform_sink()` dan los de la plataforma. |
 | `video::{h264, packet, assemble}` | Núcleo del vídeo, sans-IO: unidades NAL y keyframes (IDR); `Packetizer` (NAL sola, STAP-A con SPS/PPS, FU-A a 1200 bytes, timestamp a 90 kHz desde `EncodedFrame::timestamp`, marcador y rotación en el último paquete); `FrameAssembler` (paquetes → access units Annex-B en orden de decodificación, descarte de tramas incompletas y petición de keyframe). |
 | `video::bitrate` | `BitrateController`: control por pérdidas de los receiver reports (al estilo de la parte de pérdidas de GCC) con tope por REMB; función pura con el tiempo como entrada. |
 | `video::call` | `VideoCall` (tres tareas de Tokio: envío, realimentación, recepción), `RemoteVideo` (paquetes → tramas, PLI), y el transporte abstracto `FrameSink` / `FeedbackSource` / `FrameSource` / `VideoPacketSource`. Independiente de la `Call` de audio. |
@@ -165,8 +166,32 @@ VideoPacketSource (TrackVideoPackets) → RemoteVideo (FrameAssembler, PLI) → 
   keyframe anterior reordenada) y caen al llegar ella o por tiempo. PLI como mucho cada
   `KEYFRAME_REQUEST_INTERVAL` (500 ms) mientras se deba. Un payload corrupto (FU-A sin inicio,
   STAP-A truncado, NAL no WebRTC) descarta la trama y pide keyframe.
-- **El decodificador pide keyframe**: si `VideoSink::push` devuelve error, `VideoCall` pide una
-  (PLI) y el ensamblador descarta deltas hasta que llegue. No hace falta tocar el contrato.
+- **El decodificador pide keyframe** por dos caminos: si `VideoSink::push` devuelve error,
+  `VideoCall` pide una (PLI) y el ensamblador descarta deltas hasta que llegue; y
+  **`VideoSink::keyframe_needed()`** (método por defecto, `false`), que `VideoCall` sondea tras
+  cada `push` y cada 250 ms sin tramas: si dice `true`, PLI por el mismo camino
+  (`FrameSource::request_keyframe`), **como mucho uno cada `KEYFRAME_REQUEST_INTERVAL`** (500 ms,
+  contando también los del primer camino). Dentro del intervalo no se pregunta al sink, así una
+  petición de tipo evento (iOS: `KeyframeRequests::take`) espera allí sin perderse; las de tipo
+  nivel (Android: `KeyframeRequest::is_needed`; escritorio: el `needs_keyframe` del
+  decodificador) se repiten cada 500 ms mientras duren. Contador: `sink_keyframe_requests`.
+- **Cámara perdida**: **`VideoSource::lost()`** (por defecto `false`; Android lo implementa con
+  `camera_lost()`). La tarea de envío lo mira en cada tick (salvo en pausa: al reanudar se
+  arranca de todos modos) y, si es `true`, para y arranca la fuente otra vez con la cámara y el
+  bitrate actuales y pide keyframe, **como mucho una vez por `CAMERA_RESTART_INTERVAL`** (1 s).
+  Estadísticas: `camera_lost` (sigue perdida) y `camera_restarts`. El arranque es síncrono en la
+  tarea (como `resume`): raro y corto, no merece un hilo aparte.
+- **`platform_source()` / `platform_sink()`**, como `audio::platform_backend()`: la cámara y la
+  pantalla de la plataforma, paradas, **con su tipo concreto** (`PlatformSource`,
+  `PlatformSink`: `ios::{CameraSource, DisplaySink}`, `android::{CameraSource, DisplaySink}`,
+  `desktop::{CameraSource, WindowSink}` con la feature `desktop`) para que la app llegue a su
+  vista (capa en iOS, `set_surface` en Android, `WindowSink::slot` en el escritorio) antes de
+  meterlas en una `Box` para `VideoCall`. Sin plataforma, `NoPlatform` (enum vacío) y
+  `VideoError::Unsupported`.
+- **H.264 compartido**: `video::h264` (código de inicio, tipos NAL, `nal_units`, `is_keyframe`)
+  lo usan también iOS, Android y OpenH264; `nal_units` quita los ceros de cola también de la
+  última unidad (como hacían las copias). Se quedan en cada plataforma solo sus piezas: AVCC y el
+  desmontaje para CoreMedia (iOS); conversión AVCC y lector del SPS (Android).
 - **Bitrate** (`BitrateController`): pérdida > 10 % → baja `×(1 − 0,5·pérdida)` (como mucho cada
   300 ms); < 2 % y RTT ≤ 500 ms → sube un 5 % (como mucho una vez por segundo); entre medias,
   se mantiene. El REMB es tope (y un REMB mayor solo sube el tope). Siempre con `clamp_bitrate`.
@@ -177,8 +202,9 @@ VideoPacketSource (TrackVideoPackets) → RemoteVideo (FrameAssembler, PLI) → 
   obliga a tener un codificador en el núcleo.) `switch_camera` en pausa solo cambia la cámara
   con la que se reanudará.
 - **Estadísticas** (`VideoStats`): tramas enviadas/keyframes, errores, descartes del canal,
-  peticiones de keyframe recibidas, bitrate, tramas mostradas, errores del sink y las del
-  ensamblador (descartadas, PLI enviados, tardías, duplicadas). Sin contenido ni identificadores.
+  peticiones de keyframe recibidas, bitrate, tramas mostradas, errores del sink, peticiones de
+  keyframe del sink, cámara perdida y reinicios, y las del ensamblador (descartadas, PLI
+  enviados, tardías, duplicadas). Sin contenido ni identificadores.
 - **Interceptores de vídeo** en `peer_connection_builder`: NACK (generador y respondedor, sin RTX:
   las retransmisiones van por el SSRC original), transport-cc solo de recepción (generamos el
   feedback TWCC que usa la estimación de ancho de banda del navegador) y el de feedback.
@@ -267,8 +293,9 @@ Todo el detalle está en la doc del módulo (`src/video/android.rs`). En corto:
   Kotlin. Cambiarla exige otro decodificador: se espera al siguiente keyframe (mientras, se ve con
   la rotación anterior y se pide keyframe). `DisplaySink::video_size()` da el tamaño ya girado
   para el aspecto de la vista.
-- **Señal de keyframe**: `DisplaySink::keyframe_request()` devuelve un `KeyframeRequest` que la
-  cadena sondea; mientras `is_needed()` sea `true`, manda PLI (con su propio límite de ritmo). Se
+- **Señal de keyframe**: `VideoCall` sondea `VideoSink::keyframe_needed()`, que es el mismo
+  `KeyframeRequest::is_needed()` que da `DisplaySink::keyframe_request()`; mientras sea `true`,
+  manda PLI (uno cada 500 ms como mucho). Se
   enciende antes del primer keyframe, al perder una trama (sin búfer de entrada libre), tras un
   error del decodificador (se reconstruye en el siguiente keyframe), tras un cambio de superficie
   que no pudo seguir y mientras espera un cambio de rotación. Los errores del decodificador nunca
@@ -296,7 +323,8 @@ Todo el detalle está en la doc del módulo (`src/video/android.rs`). En corto:
 3. Usar `SurfaceView`: la vista previa recibe la transformación de la cámara (derecha y espejada en
    la frontal) y el vídeo remoto, la rotación del decodificador.
 4. Llamar a `CameraSource::set_display_rotation` al girar la actividad (no hace falta en una
-   pantalla solo vertical) y reiniciar la fuente si `camera_lost()` (otra app cogió la cámara).
+   pantalla solo vertical). Si otra app coge la cámara (`camera_lost()`), `VideoCall` la vuelve
+   a arrancar por `VideoSource::lost`; fuera de una `VideoCall`, lo hace quien tenga la fuente.
 5. Para vídeo en segundo plano, servicio en primer plano de tipo `camera`.
 
 Notas: el proceso necesita hilos de binder para que la cámara rellene superficies cuya cola vive
@@ -354,9 +382,12 @@ cargo fmt --check
 cargo run --release --example call_demo --features desktop -- --loss 10 --jitter 40 --delay 50 --seconds 30
 cargo run --example mic_echo --features desktop    # solo dispositivos, 200 ms de eco
 
-# Vídeo en el Mac: cámara → OpenH264 → red simulada → OpenH264 → ventana, con vista previa.
-# Pide permiso de cámara para el terminal la primera vez; Escape o cerrar la ventana para salir.
+# Vídeo en el Mac: cámara → OpenH264 → VideoCall (RTP, simulated_video_link, reensamblado, PLI,
+# bitrate) → OpenH264 → ventana, con vista previa. Pide permiso de cámara para el terminal la
+# primera vez; Escape o cerrar la ventana para salir. --source fake: FakeSource y FakeSink, sin
+# cámara ni ventana, solo contadores (10 s o --seconds).
 cargo run --release --example video_demo --features desktop -- --loss 5 --jitter 30 --delay 50
+cargo run --release --example video_demo --features desktop -- --source fake --seconds 5
 cargo test --features openh264 --lib video::openh264 -- --nocapture   # PSNR y bitrate medidos
 cargo test --features desktop --lib video::desktop -- --ignored captures_encoded_frames_from_the_camera
 
@@ -441,10 +472,15 @@ target. Sin secretos.
   (en la app, junto a la `Call`); probar una desconexión real (enchufar cascos o Bluetooth en
   plena llamada), Android 8.x (sin preset) y más teléfonos; comprobar el AEC en una llamada real.
 - **Vídeo Android**: probar `CameraSource`/`DisplaySink` dentro de la app (JNI con las
-  `Surface`, permiso, servicio en primer plano) y en más fabricantes; decidir si se marca el SPS
-  como Constrained Baseline (la tableta da `42 00 1f`: Baseline sin `constraint_set1`, aunque la
-  SDP anuncie `42e01f`) o se pide `AVCProfileConstrainedBaseline` (API 27) cuando exista; camino
-  con copia para API 24–25 si hiciera falta.
+  `Surface`, permiso, servicio en primer plano) y en más fabricantes; camino con copia para
+  API 24–25 si hiciera falta. Probar en el dispositivo los dos métodos nuevos del contrato
+  (`keyframe_needed`, `lost`): sus tests de la tableta están escritos pero sin ejecutar.
+- **SPS `42001f` frente al `42e01f` anunciado**: el codificador MediaTek de la tableta da
+  `42 00 1f` (Baseline sin `constraint_set1`) aunque la SDP anuncie Constrained Baseline
+  `42e01f`. Decidir si se reescribe el byte de restricciones del SPS antes de enviar (válido si el
+  flujo no usa FMO, ASO ni slices redundantes, lo normal en un codificador de hardware; hay que
+  comprobarlo) o se pide `AVCProfileConstrainedBaseline` (API 27) cuando exista; probar qué hacen
+  Chrome y Safari con él.
 - **Integración en la app de FlickerTalk** (`app/`): sustituir el audio del WebView en las
   llamadas; señalización y ciclo de vida de la llamada.
 - **DTX y marcas de tiempo RTP en el jitter buffer**: hoy supone 20 ms por secuencia; con DTX los
@@ -455,12 +491,22 @@ target. Sin secretos.
 - Notas del jitter buffer: al drenar exceso descarta una trama real por segundo mientras baja el
   retardo.
 - Paquetes de otras duraciones (10, 40, 60 ms): hoy se tratan como error y se ocultan.
-- **Vídeo, pendiente**: RTX (hoy las retransmisiones NACK van por el SSRC original); estimación
-  de ancho de banda por transport-cc en el emisor (hoy solo pérdidas de los RR y REMB; el
-  interceptor GCC de webrtc-rs sin probar); el REMB cuenta todo lo que lista (audio incluido);
-  el número de secuencia del FIR no se usa para deduplicar; probar la interoperabilidad real con
-  Chrome, Safari y el WebView (answer de un navegador, perfiles H.264 que ofrece, lectura de la
-  CVO y del PLI con `sender_ssrc`); las fuentes y sumideros de plataforma (ramas aparte).
+- **Vídeo, pendiente**: **RTX** (hoy las retransmisiones NACK van por el SSRC original) y
+  **pacing** (una keyframe sale de golpe, todos sus paquetes seguidos); estimación de ancho de
+  banda por transport-cc en el emisor (hoy solo pérdidas de los RR y REMB; el interceptor GCC de
+  webrtc-rs sin probar); el REMB cuenta todo lo que lista (audio incluido); el número de secuencia
+  del FIR no se usa para deduplicar; probar la interoperabilidad real con Chrome, Safari y el
+  WebView (answer de un navegador, perfiles H.264 que ofrece, lectura de la CVO y del PLI con
+  `sender_ssrc`). El enlace de vídeo del simulador no hace NACK ni lleva receiver reports: con
+  pérdida, cada trama perdida cuesta un keyframe y el bitrate no baja (se ve en `video_demo
+  --source fake --loss 3`).
+- **`lost()` en iOS y escritorio**: solo Android lo implementa. En iOS, las interrupciones de
+  `AVCaptureSession` (y `AVCaptureSessionRuntimeError`); en el escritorio, el hilo de captura que
+  acaba con error.
+- **OpenH264 y patentes**: la licencia de patentes H.264 que paga Cisco solo cubre sus binarios;
+  nuestro OpenH264 se compila desde el código fuente, así que `openh264`/`desktop` son para
+  pruebas y el escritorio y **no** van en los teléfonos (usan el códec del hardware). Si algún
+  día hace falta H.264 por software en un móvil, cargar el binario de Cisco.
 - **Vídeo iOS**: probarlo con la cámara real del iPhone (en el simulador no hay cámara) y con la
   pantalla bloqueada/en segundo plano (la cámara se para; la capa se vacía y debe pedir keyframe).
   El delegado no se declara conforme al protocolo `AVCaptureVideoDataOutputSampleBufferDelegate`
@@ -468,15 +514,29 @@ target. Sin secretos.
   la cámara no se fija (`activeVideoMinFrameDuration`): se diezman tramas. En iOS 17+ los métodos de
   encolar de la capa pasan a `sampleBufferRenderer`; con objetivo 15 se usan los de la capa.
   Contador de fallos de la capa y de tramas descartadas por el `DecodeGate` para las estadísticas.
-- **`video_demo` sobre `VideoCall`**: hoy usa su propio enlace (`FrameLink`: una trama entera por
-  paquete simulado, reordenación con 80 ms de espera, pérdida → keyframe). Cuando se fusione
-  `VideoCall` (`VideoSender`/`VideoReceiver`), pasarla a `VideoCall` sobre `simulated_link`
-  (hay un `TODO` en la demo).
 - nokhwa 0.10 arrastra `block` 0.1.6, que Rust avisa que dejará de compilar
   (`future-incompat`); si llega a romper, sustituir nokhwa por `objc2-av-foundation`.
-- La demo de vídeo aún no la ha visto nadie con la cámara: falta que Ioan la ejecute.
+- La demo de vídeo aún no la ha visto nadie con la cámara: falta que Ioan la ejecute (con
+  `--source fake` corre y da los contadores esperados).
 
 ## Estado (2026-09-28)
+
+**Vídeo** (rama `video`, desde el contrato `7a635bf`): fusionadas, por este orden,
+`audio-engine` (backends de audio de los teléfonos), `video-core`, `video-ios`, `video-android` y
+`video-desktop`. Conflictos solo en `CLAUDE.md`, `README.md`, `Cargo.toml`, `Cargo.lock` y las
+líneas `mod` de `src/video.rs`; resueltos conservando todos los lados (en `Cargo.lock`, la unión
+de dependencias, que `--locked` acepta). Encima:
+
+- `VideoSink::keyframe_needed()` y `VideoSource::lost()`, métodos por defecto (compatibles hacia
+  atrás), implementados en los sumideros de iOS, Android y escritorio y en la cámara de Android;
+  `VideoCall` los sondea (PLI limitado a uno cada 500 ms; reinicio de la cámara como mucho cada
+  segundo) y los cuenta en `VideoStats`.
+- Un solo `video::h264` para iOS, Android y OpenH264 (ver arriba lo que se queda en cada uno).
+- `video_demo` sobre `VideoCall` y `simulated_video_link`, con `--source camera|fake`.
+- `video::platform_source()` / `platform_sink()` y `WindowSink::slot()`.
+- Comprobado: fmt, clippy con y sin features, tests, clippy y build de iOS (dispositivo y
+  simulador; los tests de `video::ios` pasan en el simulador, el nuevo incluido) y de Android, y
+  las builds release de `video_demo` y `call_demo`. Nada ejecutado en teléfonos ni tabletas.
 
 **Backends de los teléfonos** (rama `backends`, desde `audio-engine`): fusionadas
 `ios-backend` y `android-backend` (conflictos solo en `README.md` y `CLAUDE.md`, resueltos
