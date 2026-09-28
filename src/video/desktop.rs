@@ -2,11 +2,86 @@
 //! `nokhwa` (AVFoundation) encoded with [`SoftwareEncoder`](super::openh264::SoftwareEncoder),
 //! and a window through `minifb` fed by [`SoftwareDecoder`](super::openh264::SoftwareDecoder).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
-use super::openh264::{I420Frame, SoftwareDecoder};
-use super::{EncodedFrame, Rotation, VideoError, VideoSink};
+use super::openh264::{I420Frame, SoftwareDecoder, SoftwareEncoder};
+use super::{
+    EncodedFrame, FrameSender, Rotation, SendOutcome, VideoConfig, VideoError, VideoSink,
+    clamp_bitrate,
+};
+
+/// What the engine asks of a running camera, read by its capture thread before each frame.
+#[derive(Debug)]
+struct Controls {
+    keyframe: AtomicBool,
+    bitrate_bps: AtomicU32,
+}
+
+impl Controls {
+    fn new(bitrate_bps: u32) -> Self {
+        Self {
+            keyframe: AtomicBool::new(false),
+            bitrate_bps: AtomicU32::new(clamp_bitrate(bitrate_bps)),
+        }
+    }
+
+    fn request_keyframe(&self) {
+        self.keyframe.store(true, Ordering::Relaxed);
+    }
+
+    fn set_bitrate(&self, bps: u32) {
+        self.bitrate_bps
+            .store(clamp_bitrate(bps), Ordering::Relaxed);
+    }
+}
+
+/// The camera thread's work once it has a picture: encode it as asked and send it, and show it
+/// in the local preview. Kept apart from the camera so that it can be tested without one.
+struct CapturePipeline {
+    encoder: SoftwareEncoder,
+    out: FrameSender,
+    controls: Arc<Controls>,
+    preview: FrameSlot,
+}
+
+impl CapturePipeline {
+    fn new(
+        config: VideoConfig,
+        out: FrameSender,
+        controls: Arc<Controls>,
+        preview: FrameSlot,
+    ) -> Result<Self, VideoError> {
+        Ok(Self {
+            encoder: SoftwareEncoder::new(config)?,
+            out,
+            controls,
+            preview,
+        })
+    }
+
+    fn process(
+        &mut self,
+        picture: I420Frame,
+        timestamp: Duration,
+    ) -> Result<SendOutcome, VideoError> {
+        let bitrate = self.controls.bitrate_bps.load(Ordering::Relaxed);
+        if bitrate != self.encoder.bitrate() {
+            self.encoder.set_bitrate(bitrate);
+        }
+        if self.controls.keyframe.swap(false, Ordering::Relaxed) || self.out.keyframe_needed() {
+            self.encoder.force_keyframe();
+        }
+        let outcome = match self.encoder.encode(&picture, timestamp)? {
+            Some(frame) => self.out.try_send(frame),
+            None => SendOutcome::Dropped,
+        };
+        // A desktop camera gives upright pictures.
+        self.preview.publish(picture, Rotation::Deg0);
+        Ok(outcome)
+    }
+}
 
 /// A decoded or captured picture and how to turn it to show it upright.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,11 +282,8 @@ pub fn yuyv_to_i420(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::video::VideoConfig;
-    use crate::video::openh264::SoftwareEncoder;
+    use crate::video::frame_channel;
 
     /// `count` encoded frames of the test pattern, with a keyframe forced at each of `keyframes`.
     fn encoded(count: u32, keyframes: &[u32]) -> Vec<EncodedFrame> {
@@ -231,6 +303,83 @@ mod tests {
                 encoder.encode(&picture, at).unwrap().unwrap()
             })
             .collect()
+    }
+
+    fn pattern(index: u32) -> I420Frame {
+        I420Frame::test_pattern(320, 240, index).unwrap()
+    }
+
+    fn at(index: u32) -> Duration {
+        Duration::from_millis(u64::from(index) * 33)
+    }
+
+    fn pipeline(capacity: usize) -> (CapturePipeline, crate::video::FrameReceiver, FrameSlot) {
+        let (out, frames) = frame_channel(capacity);
+        let preview = FrameSlot::new();
+        let config = VideoConfig {
+            width: 320,
+            height: 240,
+            ..VideoConfig::default()
+        };
+        let controls = Arc::new(Controls::new(config.bitrate_bps));
+        let pipeline = CapturePipeline::new(config, out, controls, preview.clone()).unwrap();
+        (pipeline, frames, preview)
+    }
+
+    #[test]
+    fn the_camera_sends_a_keyframe_first_and_shows_its_preview() {
+        let (mut pipeline, frames, preview) = pipeline(3);
+        assert_eq!(pipeline.process(pattern(0), at(0)), Ok(SendOutcome::Sent));
+        let first = frames.try_recv().unwrap();
+        assert!(first.keyframe);
+        assert_eq!(first.timestamp, at(0));
+        assert_eq!(preview.latest().unwrap().frame.as_ref(), &pattern(0));
+
+        assert_eq!(pipeline.process(pattern(1), at(1)), Ok(SendOutcome::Sent));
+        assert!(!frames.try_recv().unwrap().keyframe);
+    }
+
+    #[test]
+    fn a_requested_keyframe_is_the_next_frame() {
+        let (mut pipeline, frames, _) = pipeline(3);
+        for index in 0..2 {
+            let _ = pipeline.process(pattern(index), at(index));
+            frames.try_recv().unwrap();
+        }
+        pipeline.controls.request_keyframe();
+        let _ = pipeline.process(pattern(2), at(2));
+        assert!(frames.try_recv().unwrap().keyframe);
+        let _ = pipeline.process(pattern(3), at(3));
+        assert!(!frames.try_recv().unwrap().keyframe, "asked for once");
+    }
+
+    #[test]
+    fn a_keyframe_owed_by_the_channel_is_the_next_frame() {
+        let (mut pipeline, frames, _) = pipeline(1);
+        assert_eq!(pipeline.process(pattern(0), at(0)), Ok(SendOutcome::Sent));
+        assert_eq!(
+            pipeline.process(pattern(1), at(1)),
+            Ok(SendOutcome::Dropped)
+        );
+        frames.try_recv().unwrap();
+        assert_eq!(pipeline.process(pattern(2), at(2)), Ok(SendOutcome::Sent));
+        assert!(frames.try_recv().unwrap().keyframe);
+    }
+
+    #[test]
+    fn a_new_bitrate_reaches_the_encoder() {
+        let (mut pipeline, _frames, _) = pipeline(3);
+        let _ = pipeline.process(pattern(0), at(0));
+        pipeline.controls.set_bitrate(300_000);
+        let _ = pipeline.process(pattern(1), at(1));
+        assert_eq!(pipeline.encoder.bitrate(), 300_000);
+    }
+
+    #[test]
+    fn the_camera_learns_when_the_engine_is_gone() {
+        let (mut pipeline, frames, _) = pipeline(3);
+        drop(frames);
+        assert_eq!(pipeline.process(pattern(0), at(0)), Ok(SendOutcome::Closed));
     }
 
     #[test]
