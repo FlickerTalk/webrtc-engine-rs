@@ -1,17 +1,12 @@
 //! H.264 bitstream plumbing between VideoToolbox / CoreMedia (AVCC, length-prefixed NAL units)
 //! and the engine (Annex-B, start codes). Pure functions, tested on the host.
 
-/// The four-byte Annex-B start code this module writes.
-pub(crate) const START_CODE: [u8; 4] = [0, 0, 0, 1];
-
-/// NAL unit types (ITU-T H.264, table 7-1) this module cares about.
-pub(crate) const NAL_SLICE: u8 = 1;
-pub(crate) const NAL_IDR: u8 = 5;
+// Start code, NAL unit types and the Annex-B splitter are the engine's (`video::h264`).
 #[cfg(test)]
-pub(crate) const NAL_SEI: u8 = 6;
-pub(crate) const NAL_SPS: u8 = 7;
-pub(crate) const NAL_PPS: u8 = 8;
-pub(crate) const NAL_AUD: u8 = 9;
+pub(crate) use crate::video::h264::NAL_SEI;
+pub(crate) use crate::video::h264::{
+    NAL_AUD, NAL_IDR, NAL_PPS, NAL_SLICE, NAL_SPS, START_CODE, nal_units as annexb_nals,
+};
 
 /// Why a bitstream could not be converted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,9 +19,9 @@ pub(crate) enum H264Error {
     Empty,
 }
 
-/// The type of a NAL unit, from its header byte.
+/// The type of a NAL unit, from its header byte; `None` for an empty unit.
 pub(crate) fn nal_type(nal: &[u8]) -> Option<u8> {
-    nal.first().map(|header| header & 0x1f)
+    nal.first().map(|&header| crate::video::h264::nal_type(header))
 }
 
 /// Splits AVCC data (each NAL unit behind a big-endian length of `length_size` bytes).
@@ -54,41 +49,6 @@ pub(crate) fn avcc_nals(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>, H
         return Err(H264Error::Empty);
     }
     Ok(nals)
-}
-
-/// Splits Annex-B data on `00 00 01` and `00 00 00 01` start codes. Bytes before the first start
-/// code, empty NAL units and the zero bytes that trail a NAL unit are left out.
-pub(crate) fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
-    let mut nals = Vec::new();
-    let mut start = None;
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i..i + 3] == [0, 0, 1] {
-            if let Some(from) = start {
-                push_trimmed(&mut nals, &data[from..i]);
-            }
-            i += 3;
-            start = Some(i);
-        } else {
-            i += 1;
-        }
-    }
-    if let Some(from) = start {
-        push_trimmed(&mut nals, &data[from..]);
-    }
-    nals
-}
-
-/// Pushes `nal` without its trailing zero bytes (the first byte of a four-byte start code, or
-/// `trailing_zero_8bits`), unless nothing is left.
-fn push_trimmed<'a>(nals: &mut Vec<&'a [u8]>, nal: &'a [u8]) {
-    let end = nal
-        .iter()
-        .rposition(|&byte| byte != 0)
-        .map_or(0, |last| last + 1);
-    if end > 0 {
-        nals.push(&nal[..end]);
-    }
 }
 
 /// Whether the NAL units hold an IDR slice.
