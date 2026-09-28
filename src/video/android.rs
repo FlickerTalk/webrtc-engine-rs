@@ -79,12 +79,9 @@ use std::ffi::CStr;
 
 use super::{EncodedFrame, Facing, Rotation, VideoConfig, VideoError, clamp_bitrate};
 
-/// NAL unit types (H.264 table 7-1) the backend looks at.
-const NAL_IDR: u8 = 5;
-const NAL_SPS: u8 = 7;
-const NAL_PPS: u8 = 8;
-/// The 4-byte Annex-B start code.
-const START_CODE: [u8; 4] = [0, 0, 0, 1];
+// The start code, the NAL unit types and the Annex-B splitter are the engine's (`video::h264`);
+// the AVCC conversion and the SPS reader below are MediaCodec's business.
+use super::h264::{NAL_IDR, NAL_PPS, NAL_SPS, START_CODE, nal_units};
 
 /// `BUFFER_FLAG_KEY_FRAME`: the buffer holds a sync frame.
 const BUFFER_FLAG_KEY_FRAME: u32 = 1;
@@ -93,37 +90,9 @@ const BUFFER_FLAG_KEY_FRAME: u32 = 1;
 #[cfg(test)]
 const BUFFER_FLAG_CODEC_CONFIG: u32 = 2;
 
-/// The type of a NAL unit (its first byte, without start code).
+/// The type of a NAL unit (its first byte, without start code); `None` for an empty unit.
 fn nal_type(nal: &[u8]) -> Option<u8> {
-    nal.first().map(|header| header & 0x1f)
-}
-
-/// The NAL units of an Annex-B buffer, without their start codes. Bytes before the first start
-/// code are skipped, and the zeros ahead of a 4-byte start code are not part of the unit before.
-fn nal_units(data: &[u8]) -> Vec<&[u8]> {
-    // Where each unit starts: just after a `00 00 01`.
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i..i + 3] == [0, 0, 1] {
-            starts.push(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    starts
-        .iter()
-        .enumerate()
-        .filter_map(|(n, &start)| {
-            let end = starts.get(n + 1).map_or(data.len(), |next| next - 3);
-            let mut unit = data.get(start..end)?;
-            while let [rest @ .., 0] = unit {
-                unit = rest;
-            }
-            (!unit.is_empty()).then_some(unit)
-        })
-        .collect()
+    nal.first().map(|&header| super::h264::nal_type(header))
 }
 
 /// Whether `data` starts with an Annex-B start code.
