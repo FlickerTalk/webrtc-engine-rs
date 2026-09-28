@@ -1,9 +1,13 @@
 //! iOS backend on the `VoiceProcessingIO` audio unit.
 
 use std::ffi::c_void;
-
-use super::{AudioError, CaptureAdapter, Counter, RingProducer, SAMPLE_RATE, StreamFormat};
 use std::mem::size_of;
+
+use super::format::Sample;
+use super::{
+    AudioError, CaptureAdapter, Counter, PlayoutAdapter, RingConsumer, RingProducer, SAMPLE_RATE,
+    StreamFormat,
+};
 
 // The few AudioToolbox / CoreAudioTypes declarations this backend needs, copied from the iOS SDK
 // headers (`AUComponent.h`, `AudioUnitProperties.h`, `CoreAudioBaseTypes.h`). The layout tests
@@ -256,6 +260,112 @@ impl Capture {
         }
         let rendered = (list.buffers[0].data_byte_size as usize / sample_bytes).min(samples);
         self.buffer.push_to(&mut self.adapter, rendered);
+    }
+}
+
+/// `kAudio_ParamError`, for a callback handed no buffer list.
+const K_AUDIO_PARAM_ERROR: OSStatus = -50;
+
+/// `AudioTimeStamp`, only ever passed through by pointer.
+#[repr(C)]
+pub(crate) struct AudioTimeStamp {
+    _opaque: [u8; 0],
+}
+
+/// The speaker half of the unit: fills the unit's buffers from a [`PlayoutAdapter`].
+pub(crate) struct Playout {
+    adapter: PlayoutAdapter,
+    kind: SampleKind,
+}
+
+impl Playout {
+    /// A playout for `format`, reading from `consumer`.
+    pub(crate) fn new(format: DeviceFormat, consumer: RingConsumer) -> Result<Self, AudioError> {
+        Ok(Self {
+            adapter: PlayoutAdapter::new(format.stream, consumer)?,
+            kind: format.kind,
+        })
+    }
+
+    /// How many callbacks ran out of samples and played silence.
+    pub(crate) fn underruns(&self) -> Counter {
+        self.adapter.underruns()
+    }
+
+    /// Fills `list` for one render callback.
+    ///
+    /// # Safety
+    ///
+    /// `list` is null or points at a valid `AudioBufferList` with `number_buffers` buffers,
+    /// each null or holding `data_byte_size` writable bytes, aligned for the sample type.
+    unsafe fn render(&mut self, list: *mut AudioBufferList) -> OSStatus {
+        if list.is_null() {
+            return K_AUDIO_PARAM_ERROR;
+        }
+        // SAFETY: `list` is not null, so the caller guarantees it is a valid list.
+        let (count, first) = unsafe {
+            (
+                (*list).number_buffers as usize,
+                (&raw mut (*list).buffers).cast::<AudioBuffer>(),
+            )
+        };
+        for index in 0..count {
+            // SAFETY: the list holds `count` buffers, one after another from `buffers`.
+            let buffer = unsafe { *first.add(index) };
+            if buffer.data.is_null() {
+                continue;
+            }
+            // The formats this backend accepts come in one buffer; anything more is silenced.
+            let from_ring = index == 0;
+            // SAFETY: the caller guarantees `data` holds `data_byte_size` bytes of samples of
+            // the unit's format, which is `self.kind`.
+            unsafe {
+                match self.kind {
+                    SampleKind::I16 => fill::<i16>(&mut self.adapter, buffer, from_ring),
+                    SampleKind::F32 => fill::<f32>(&mut self.adapter, buffer, from_ring),
+                }
+            }
+        }
+        0
+    }
+}
+
+/// Fills `buffer` from `adapter`, or with silence.
+///
+/// # Safety
+///
+/// `buffer.data` is not null and holds `data_byte_size` writable bytes, aligned for `S`.
+unsafe fn fill<S: Sample>(adapter: &mut PlayoutAdapter, buffer: AudioBuffer, from_ring: bool) {
+    let len = buffer.data_byte_size as usize / size_of::<S>();
+    // SAFETY: guaranteed by the caller.
+    let samples = unsafe { std::slice::from_raw_parts_mut(buffer.data.cast::<S>(), len) };
+    if from_ring {
+        adapter.fill(samples);
+    } else {
+        samples.fill(S::from_f32(0.0));
+    }
+}
+
+/// The unit's render callback (`AURenderCallback`) on the speaker bus: `ref_con` is the
+/// [`Playout`].
+///
+/// # Safety
+///
+/// `ref_con` points at a `Playout` that nothing else touches while the callback runs, and
+/// `data` is what [`Playout::render`] expects. The unit guarantees both while it is started.
+pub(crate) unsafe extern "C" fn render_callback(
+    ref_con: *mut c_void,
+    _action_flags: *mut u32,
+    _time_stamp: *const AudioTimeStamp,
+    _bus: u32,
+    _frames: u32,
+    data: *mut AudioBufferList,
+) -> OSStatus {
+    // SAFETY: the caller hands the `Playout` registered with the callback, used by this
+    // callback alone, and a buffer list as `render` requires.
+    unsafe {
+        let playout = &mut *ref_con.cast::<Playout>();
+        playout.render(data)
     }
 }
 
@@ -587,6 +697,114 @@ mod tests {
             0
         });
         assert_eq!(drain(&mut consumer), [1, 2]);
+    }
+
+    /// A two-buffer `AudioBufferList`, as the unit would hand non-interleaved stereo.
+    #[repr(C)]
+    struct TwoBufferList {
+        number_buffers: u32,
+        buffers: [AudioBuffer; 2],
+    }
+
+    fn buffer_for<S>(samples: &mut [S], channels: u32) -> AudioBuffer {
+        AudioBuffer {
+            number_channels: channels,
+            data_byte_size: size_of_val(samples) as u32,
+            data: samples.as_mut_ptr().cast(),
+        }
+    }
+
+    /// Runs the render callback the way the unit does.
+    fn call_render(playout: &mut Playout, list: *mut AudioBufferList) -> OSStatus {
+        let mut flags = 0;
+        // SAFETY: `playout` is borrowed for the call alone; `list` is null or built by the test
+        // over live buffers.
+        unsafe {
+            render_callback(
+                (playout as *mut Playout).cast(),
+                &mut flags,
+                std::ptr::null(),
+                0,
+                0,
+                list,
+            )
+        }
+    }
+
+    fn playout_with(format: DeviceFormat, queued: &[i16]) -> (Playout, crate::audio::RingProducer) {
+        let (mut producer, consumer) = ring(4096);
+        producer.push(queued);
+        (Playout::new(format, consumer).unwrap(), producer)
+    }
+
+    #[test]
+    fn the_render_callback_plays_the_ring_into_an_i16_buffer() {
+        let queued: Vec<i16> = (0..256).map(|n| n * 100 - 12800).collect();
+        let (mut playout, _producer) =
+            playout_with(format(SAMPLE_RATE, 1, SampleKind::I16), &queued);
+        let mut played = vec![0i16; 256];
+        let mut list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [buffer_for(&mut played, 1)],
+        };
+
+        assert_eq!(call_render(&mut playout, &mut list), 0);
+        assert_eq!(played, queued);
+        assert_eq!(playout.underruns().get(), 0);
+    }
+
+    #[test]
+    fn the_render_callback_fills_f32_stereo_from_mono() {
+        let (mut playout, _producer) =
+            playout_with(format(SAMPLE_RATE, 2, SampleKind::F32), &[16384, -8192]);
+        let mut played = [9.0f32; 4];
+        let mut list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [buffer_for(&mut played, 2)],
+        };
+
+        assert_eq!(call_render(&mut playout, &mut list), 0);
+        assert_eq!(played, [0.5, 0.5, -0.25, -0.25]);
+    }
+
+    #[test]
+    fn a_dry_ring_plays_silence_and_counts_an_underrun() {
+        let (mut playout, _producer) = playout_with(format(SAMPLE_RATE, 1, SampleKind::I16), &[]);
+        let mut played = [7i16; 64];
+        let mut list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [buffer_for(&mut played, 1)],
+        };
+
+        assert_eq!(call_render(&mut playout, &mut list), 0);
+        assert_eq!(played, [0; 64]);
+        assert_eq!(playout.underruns().get(), 1);
+    }
+
+    #[test]
+    fn buffers_after_the_first_get_silence() {
+        let (mut playout, _producer) =
+            playout_with(format(SAMPLE_RATE, 1, SampleKind::I16), &[1, 2, 3, 4]);
+        let mut first = [9i16; 4];
+        let mut second = [9i16; 4];
+        let mut list = TwoBufferList {
+            number_buffers: 2,
+            buffers: [buffer_for(&mut first, 1), buffer_for(&mut second, 1)],
+        };
+
+        let status = call_render(&mut playout, (&mut list as *mut TwoBufferList).cast());
+        assert_eq!(status, 0);
+        assert_eq!(first, [1, 2, 3, 4]);
+        assert_eq!(second, [0; 4]);
+    }
+
+    #[test]
+    fn no_buffer_list_is_a_parameter_error() {
+        let (mut playout, _producer) = playout_with(format(SAMPLE_RATE, 1, SampleKind::I16), &[]);
+        assert_eq!(
+            call_render(&mut playout, std::ptr::null_mut()),
+            K_AUDIO_PARAM_ERROR
+        );
     }
 
     #[test]
