@@ -8,3 +8,6 @@ repository = "https://github.com/FlickerTalk/webrtc-engine-rs"
 
 
 [dependencies]
+
+[build-dependencies]
+cc = "1.5.1"
