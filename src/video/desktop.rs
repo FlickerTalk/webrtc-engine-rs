@@ -624,6 +624,11 @@ impl VideoSink for WindowSink {
         self.slot.clear();
         Ok(())
     }
+
+    /// Whether the decoder waits for a keyframe (the same as [`SinkStats::keyframe_needed`]).
+    fn keyframe_needed(&mut self) -> bool {
+        self.counters.keyframe_needed.load(Ordering::Relaxed)
+    }
 }
 
 /// Repacks a packed 4:2:2 picture in `yuvs` order (Y0 Cb Y1 Cr, video range: what AVFoundation
@@ -992,6 +997,25 @@ mod tests {
         let stats = monitor.stats();
         assert_eq!(stats.decoded, 7);
         assert!(!stats.keyframe_needed);
+    }
+
+    #[test]
+    fn the_engine_hears_through_the_contract_when_the_decoder_needs_a_keyframe() {
+        let frames = encoded(10, &[8]);
+        let mut sink: Box<dyn VideoSink> = Box::new(WindowSink::new(FrameSlot::new()));
+        sink.start().unwrap();
+        assert!(sink.keyframe_needed(), "nothing decoded yet");
+        for frame in &frames[..5] {
+            sink.push(frame.clone()).unwrap();
+        }
+        assert!(!sink.keyframe_needed());
+        // Frame 5 is lost; the flag stays up until the keyframe is decoded.
+        assert!(sink.push(frames[6].clone()).is_err());
+        assert!(sink.keyframe_needed());
+        sink.push(frames[7].clone()).unwrap();
+        assert!(sink.keyframe_needed());
+        sink.push(frames[8].clone()).unwrap();
+        assert!(!sink.keyframe_needed());
     }
 
     #[test]
