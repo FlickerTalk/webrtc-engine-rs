@@ -11,7 +11,8 @@ pub enum Playout {
     Frame(Vec<u8>),
     /// The next frame was lost: the decoder conceals it.
     Missing,
-    /// Nothing is due yet: still filling, or the buffer ran dry.
+    /// Nothing is due yet: still filling, the buffer ran dry, or it is holding back to deepen
+    /// after the network got worse. No sequence was used up; mid-call the decoder conceals.
     Waiting,
 }
 
@@ -84,6 +85,11 @@ impl JitterEstimate {
     }
 }
 
+/// Reorders packets by sequence and hands out one frame per 20 ms playout.
+///
+/// The depth adapts to the jitter measured from `push_at` arrival times, between 1 and 10
+/// frames: it grows at once when the network gets worse and shrinks one frame per calm second.
+/// `push` without times keeps the initial depth of 2 frames.
 pub struct JitterBuffer {
     /// Keyed by extended sequence, so the order survives the 16-bit wrap.
     packets: BTreeMap<i64, Vec<u8>>,
