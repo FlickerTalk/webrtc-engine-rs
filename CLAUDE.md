@@ -25,6 +25,8 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 | `call`   | La cadena. `Uplink` y `Downlink` son máquinas de estado síncronas; `Call` las ejecuta en tres tareas de Tokio (envío, recepción, reproducción). Transporte abstracto: `PacketSink` / `PacketSource`, implementados para `AudioSender`, `AudioReceiver` y `RemoteAudio`. |
 | `netsim` | `NetworkSimulator`: red simulada sans-IO y determinista con semilla (retardo, jitter uniforme, pérdida, reordenación, duplicados). `simulated_link` la usa como transporte de una `Call` con el reloj de Tokio. |
 | `video`  | Contrato del vídeo: la plataforma captura **y** codifica (y decodifica **y** pinta) con su hardware; el núcleo solo mueve access units H.264 Annex-B (`EncodedFrame`, SPS/PPS en cada keyframe). `VideoSource`, `VideoSink`, `VideoConfig`, `Facing`, `Rotation` (viaja en la extensión RTP CVO, no se rota el píxel) y el canal `frame_channel` (acotado, sin bloqueo; tras descartar exige keyframe). Puntos de anclaje de iOS/Android/escritorio en la doc del módulo. |
+| `video::openh264` | H.264 por software (feature `openh264`, desactivada por defecto) con OpenH264 de Cisco (crate `openh264` 0.9, BSD-2-Clause). `SoftwareEncoder`: I420 → Annex-B Constrained Baseline (`42c0xx`), SPS/PPS en cada keyframe, keyframes solo a petición (`force_keyframe`), `set_bitrate` en marcha sin keyframe (`ENCODER_OPTION_BITRATE`, único `unsafe`). `SoftwareDecoder`: Annex-B → I420; tras un error (`needs_keyframe`) descarta los deltas hasta el siguiente IDR. `I420Frame` (BT.601 rango limitado) con conversión RGB(A), `rgb_at` y `test_pattern` (imagen sintética en movimiento, para pruebas de otros módulos). |
+| `video::desktop` | Vídeo de escritorio (feature `desktop`, que activa `openh264`; macOS). `CameraSource` (`VideoSource`): nokhwa/AVFoundation en YUYV → I420 → `SoftwareEncoder` → `FrameSender`, en su hilo; permiso de cámara, `request_keyframe`, `set_bitrate`, `switch_camera` (la siguiente cámara o `Unsupported`) y vista previa en un `FrameSlot`. `WindowSink` (`VideoSink`): decodifica en `push` y deja la imagen en un `FrameSlot`, con `SinkMonitor` (contadores y «falta keyframe»). `VideoWindow` (minifb) pinta el remoto encajado y girado y la vista previa en espejo; **solo en el hilo principal**. |
 
 ### La cadena de la llamada (`call`)
 
@@ -66,6 +68,23 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 - **Los anillos se sondean cada 5 ms**: no tienen señal de aviso (a propósito: el callback de
   audio no debe despertar a nadie).
 - **Silencio al silenciar** en vez de dejar de enviar (ver arriba).
+- **OpenH264 con el crate `openh264` (BSD-2-Clause)**: compila el C++ de Cisco con `cc`, sin
+  cmake (comprobado: cmake no está instalado) y, en arm64, sin nasm (usa los `.S` NEON con clang;
+  en x86_64 sin nasm se queda sin ensamblador, en silencio). También compila para
+  `aarch64-apple-ios`. **Ojo**: la licencia de patentes H.264 que paga Cisco cubre solo sus
+  binarios, no una compilación desde el código fuente: esto es para pruebas y escritorio, no para
+  distribuir en los teléfonos (que usan el códec del hardware).
+- **Cámara con nokhwa 0.10 (Apache-2.0), backend AVFoundation, sin `default-features`** (sin
+  decodificador MJPEG): bindings de Objective-C sin cmake ni bindgen. Se le pide YUYV y el búfer
+  se trata como `yuvs` (Y0 Cb Y1 Cr, rango de vídeo) con el stride deducido del tamaño del búfer:
+  nokhwa etiqueta mal los formatos en macOS (manda `GRAY` fijo y llama YUYV a `420v`/`420f`).
+  La conversión a I420 es nuestra y está probada.
+- **Ventana con minifb (MIT/Apache-2.0)**: la opción más simple (un búfer `u32` y
+  `update_with_buffer`), compila su Objective-C con `cc`. En macOS AppKit exige el hilo
+  principal: `VideoWindow` no es `Send` y la demo corre su bucle en `main`; la cámara, la red y
+  el decodificador le pasan las imágenes por `FrameSlot` (solo la última; nunca hace cola).
+- **El decodificador descarta deltas tras un error** hasta el siguiente IDR (en vez de pintar
+  basura) y lo dice (`needs_keyframe` / `SinkStats::keyframe_needed`) para pedir un PLI.
 - **PRNG propio (SplitMix64) en el simulador**: su salida para una semilla no cambia al actualizar
   dependencias, así las pruebas con semilla ven siempre la misma red. No es para nada secreto.
 
@@ -83,6 +102,12 @@ cargo fmt --check
 cargo run --release --example call_demo --features desktop -- --loss 10 --jitter 40 --delay 50 --seconds 30
 cargo run --example mic_echo --features desktop    # solo dispositivos, 200 ms de eco
 
+# Vídeo en el Mac: cámara → OpenH264 → red simulada → OpenH264 → ventana, con vista previa.
+# Pide permiso de cámara para el terminal la primera vez; Escape o cerrar la ventana para salir.
+cargo run --release --example video_demo --features desktop -- --loss 5 --jitter 30 --delay 50
+cargo test --features openh264 --lib video::openh264 -- --nocapture   # PSNR y bitrate medidos
+cargo test --features desktop --lib video::desktop -- --ignored captures_encoded_frames_from_the_camera
+
 # iOS
 IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --target aarch64-apple-ios
 
@@ -93,6 +118,9 @@ AR_aarch64_linux_android=$NDK_BIN/llvm-ar \
 CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android24-clang \
 cargo build --target aarch64-linux-android
 ```
+
+La prueba de ventana (`shows_the_test_pattern_in_a_window`, `#[ignore]`) no puede pasar en macOS
+con libtest, que no ejecuta en el hilo principal: la ventana se comprueba con `video_demo`.
 
 Las pruebas de `build.rs` no las ejecuta Cargo; el comando está en el propio `build.rs`.
 
@@ -133,6 +161,13 @@ ALSA). Sin secretos.
 - Notas del jitter buffer: al drenar exceso descarta una trama real por segundo mientras baja el
   retardo.
 - Paquetes de otras duraciones (10, 40, 60 ms): hoy se tratan como error y se ocultan.
+- **`video_demo` sobre `VideoCall`**: hoy usa su propio enlace (`FrameLink`: una trama entera por
+  paquete simulado, reordenación con 80 ms de espera, pérdida → keyframe). Cuando se fusione
+  `VideoCall` (`VideoSender`/`VideoReceiver`), pasarla a `VideoCall` sobre `simulated_link`
+  (hay un `TODO` en la demo).
+- nokhwa 0.10 arrastra `block` 0.1.6, que Rust avisa que dejará de compilar
+  (`future-incompat`); si llega a romper, sustituir nokhwa por `objc2-av-foundation`.
+- La demo de vídeo aún no la ha visto nadie con la cámara: falta que Ioan la ejecute.
 
 ## Estado (2026-09-28)
 
@@ -149,3 +184,9 @@ constantes unificadas en la raíz del crate y `Cargo.lock` versionado. Hecho enc
   loopback (correlación ~0,97, ~86 ms).
 - Demo `call_demo` (feature `desktop`) para oírlo en el Mac; compila, falta que Ioan la escuche.
 - CI en `.github/workflows/ci.yml`.
+- Vídeo por software y de escritorio (rama `video-desktop`): `video::openh264` (codificador y
+  decodificador OpenH264; VGA a 800 kbit/s con la imagen de prueba: PSNR de luma ≥ 34 dB en las
+  30 primeras tramas; 150 kbit/s → ~149 kbit/s medidos, 2 Mbit/s → ~660 kbit/s, sin keyframe al
+  cambiar; una trama perdida da error y luego nada hasta el keyframe, que recupera ≥ 30 dB),
+  `video::desktop` (cámara, sumidero y ventana) y la demo `video_demo`, que compila pero falta
+  ver con la cámara.
