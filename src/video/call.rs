@@ -59,6 +59,8 @@ pub trait FeedbackSource: Send + 'static {
 /// The other side's video as whole frames, in decoding order. `None` once the stream has ended.
 pub trait FrameSource: Send + 'static {
     type Error: Send;
+    /// The next frame. Must be cancel-safe: [`VideoCall`] gives up waiting now and then to
+    /// read [`FrameSource::stats`], and calls it again.
     fn recv(&mut self) -> impl Future<Output = Result<Option<EncodedFrame>, Self::Error>> + Send;
     /// Asks the other side for a keyframe: our decoder cannot go on.
     fn request_keyframe(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -76,6 +78,10 @@ pub trait VideoPacketSource: Send + 'static {
     /// Sends the other side a keyframe request (a PLI).
     fn request_keyframe(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
+
+/// How often a [`VideoCall`] refreshes the counters of the other side's stream while no frame
+/// comes.
+const STATS_REFRESH: Duration = Duration::from_millis(250);
 
 /// How often [`RemoteVideo`] looks at the clock while no packet comes: a gap is given up, and a
 /// keyframe requested, within this of [`super::assemble::MAX_WAIT`].
@@ -99,6 +105,10 @@ impl<P: VideoPacketSource> RemoteVideo<P> {
     }
 
     /// The next whole frame. `None` once the stream has ended.
+    ///
+    /// Cancel-safe as long as the packet source's `recv` is: packets already taken stay in the
+    /// assembler. Cancelled while sending a keyframe request, that request may be lost; the
+    /// next one goes [`super::assemble::KEYFRAME_REQUEST_INTERVAL`] later.
     pub async fn recv(&mut self) -> Result<Option<EncodedFrame>, P::Error> {
         loop {
             let now = self.clock.elapsed();
@@ -496,9 +506,13 @@ async fn receive_task<R: FrameSource>(
 ) {
     let work = async {
         loop {
-            let received = remote.recv().await;
+            // Now and then even without frames, so the counters show a stream that is stuck.
+            let received = tokio::time::timeout(STATS_REFRESH, remote.recv()).await;
             let assembled = remote.stats();
             shared.update(|stats| stats.remote = assembled);
+            let Ok(received) = received else {
+                continue;
+            };
             match received {
                 Ok(Some(frame)) => {
                     let shown = lock(&shared.sink).push(frame);
@@ -639,7 +653,8 @@ mod tests {
         assert!((29..=31).contains(&shown.len()), "{shown:?}");
         assert_eq!(shown, (0..shown.len() as u32).collect::<Vec<_>>());
         assert_eq!(lock(&sink).broken, 0);
-        assert_eq!(stats.frames_sent, shown.len() as u64);
+        // The last frame sent may still be on the wire when the call stops.
+        assert!(stats.frames_sent - shown.len() as u64 <= 1, "{stats:?}");
         assert_eq!(stats.keyframes_sent, 1);
         assert_eq!(stats.frames_received, shown.len() as u64);
         assert_eq!(stats.bitrate_bps, 300_000);
@@ -773,6 +788,52 @@ mod tests {
             CONFIG,
         );
         assert!(matches!(result, Err(VideoCallError::NoRuntime)));
+    }
+
+    /// A remote stream that never completes a frame but keeps dropping them.
+    struct Stuck {
+        dropped: u64,
+    }
+
+    impl FrameSource for Stuck {
+        type Error = ();
+        async fn recv(&mut self) -> Result<Option<EncodedFrame>, ()> {
+            loop {
+                self.dropped += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        async fn request_keyframe(&mut self) -> Result<(), ()> {
+            Ok(())
+        }
+        fn stats(&self) -> AssemblerStats {
+            AssemblerStats {
+                dropped: self.dropped,
+                ..AssemblerStats::default()
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_stats_stay_fresh_while_no_frame_comes() {
+        let (_out, _frames) = mpsc::unbounded_channel::<EncodedFrame>();
+        let (_feedback, told) = mpsc::unbounded_channel();
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let transport = VideoTransport {
+            frames: WireOut(sender),
+            feedback: Told(told),
+            remote: Stuck { dropped: 0 },
+        };
+        let call = VideoCall::start(
+            Box::new(FakeSource::new()),
+            Box::new(FakeSink::new()),
+            transport,
+            CONFIG,
+        )
+        .unwrap();
+        run_for(1_000).await;
+        assert!(call.stats().remote.dropped > 50, "{:?}", call.stats());
+        call.stop().await;
     }
 
     /// Packets straight from a packetizer, some of them left out.
