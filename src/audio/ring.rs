@@ -39,6 +39,14 @@ impl Shared {
     fn capacity(&self) -> usize {
         self.slots.len()
     }
+
+    // Each end owns one position, so it never moves under its owner and the difference cannot
+    // underflow.
+    fn len(&self) -> usize {
+        let write = self.write.load(Ordering::Acquire);
+        let read = self.read.load(Ordering::Acquire);
+        write.wrapping_sub(read)
+    }
 }
 
 /// The writing end.
@@ -61,6 +69,11 @@ impl RingProducer {
         shared.write.store(write.wrapping_add(count), Ordering::Release);
         count
     }
+
+    /// How many samples can be written right now.
+    pub fn free_len(&self) -> usize {
+        self.shared.capacity() - self.shared.len()
+    }
 }
 
 /// The reading end.
@@ -82,6 +95,16 @@ impl RingConsumer {
         shared.read.store(read.wrapping_add(count), Ordering::Release);
         count
     }
+
+    /// How many samples are waiting to be read.
+    pub fn len(&self) -> usize {
+        self.shared.len()
+    }
+
+    /// Whether there is nothing to read.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[cfg(test)]
@@ -95,5 +118,93 @@ mod tests {
         let mut out = [0; 3];
         assert_eq!(consumer.pop(&mut out), 3);
         assert_eq!(out, [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_full_ring_takes_only_what_fits() {
+        let (mut producer, mut consumer) = ring(4);
+        assert_eq!(producer.push(&[1, 2, 3, 4, 5, 6]), 4);
+        assert_eq!(producer.push(&[7]), 0);
+        let mut out = [0; 8];
+        assert_eq!(consumer.pop(&mut out), 4);
+        assert_eq!(out[..4], [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn capacity_is_rounded_up_to_a_power_of_two() {
+        let (producer, _consumer) = ring(5);
+        assert_eq!(producer.free_len(), 8);
+    }
+
+    #[test]
+    fn fill_level_is_seen_from_both_ends() {
+        let (mut producer, mut consumer) = ring(8);
+        assert!(consumer.is_empty());
+        producer.push(&[1, 2, 3]);
+        assert_eq!(consumer.len(), 3);
+        assert_eq!(producer.free_len(), 5);
+        consumer.pop(&mut [0; 2]);
+        assert_eq!(consumer.len(), 1);
+        assert_eq!(producer.free_len(), 7);
+    }
+
+    #[test]
+    fn keeps_order_across_the_wrap_around() {
+        let (mut producer, mut consumer) = ring(4);
+        let mut next = 0i16;
+        let mut expected = 0i16;
+        for _ in 0..100 {
+            let chunk = [next, next + 1, next + 2];
+            assert_eq!(producer.push(&chunk), 3);
+            next += 3;
+            let mut out = [0; 3];
+            assert_eq!(consumer.pop(&mut out), 3);
+            for sample in out {
+                assert_eq!(sample, expected);
+                expected += 1;
+            }
+        }
+    }
+
+    // Two real threads with uneven chunk sizes: every sample must arrive once, in order.
+    #[test]
+    fn survives_a_producer_and_a_consumer_on_two_threads() {
+        const TOTAL: usize = 2_000_000;
+        let (mut producer, mut consumer) = ring(64);
+
+        let writer = std::thread::spawn(move || {
+            let mut sent = 0usize;
+            let mut chunk = [0i16; 37];
+            let mut size = 1;
+            while sent < TOTAL {
+                let len = size.min(TOTAL - sent);
+                for (offset, sample) in chunk[..len].iter_mut().enumerate() {
+                    *sample = (sent + offset) as u16 as i16;
+                }
+                let written = producer.push(&chunk[..len]);
+                sent += written;
+                if written == 0 {
+                    std::thread::yield_now();
+                }
+                size = size % chunk.len() + 1;
+            }
+        });
+
+        let mut received = 0usize;
+        let mut out = [0i16; 23];
+        let mut size = 1;
+        while received < TOTAL {
+            let read = consumer.pop(&mut out[..size]);
+            for &sample in &out[..read] {
+                assert_eq!(sample, received as u16 as i16, "sample {received}");
+                received += 1;
+            }
+            if read == 0 {
+                std::thread::yield_now();
+            }
+            size = size % out.len() + 1;
+        }
+        writer.join().unwrap();
+        assert!(consumer.is_empty());
     }
 }
