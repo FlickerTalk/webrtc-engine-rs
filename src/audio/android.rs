@@ -789,6 +789,12 @@ mod device {
             self.session_id = None;
             Ok(())
         }
+
+        /// Reopens both streams if a device change killed them: see
+        /// [`AaudioBackend::restart_if_needed`].
+        fn maintain(&mut self) -> Result<(), AudioError> {
+            self.restart_if_needed().map(|_| ())
+        }
     }
 
     impl Drop for AaudioBackend {
@@ -988,6 +994,22 @@ mod tests {
         #[test]
         fn aaudio_loads() {
             AaudioBackend::new().unwrap();
+        }
+
+        // Nothing is open, so the restart has no streams to reopen; what counts is that
+        // `maintain` took the request, as `restart_if_needed` does.
+        #[test]
+        fn maintain_takes_up_a_pending_restart() {
+            let mut backend = AaudioBackend::new().unwrap();
+            backend.health.report();
+            backend.maintain().unwrap();
+            assert!(!backend.health.take_restart());
+        }
+
+        #[test]
+        fn the_platform_backend_loads_on_android() {
+            let mut backend = crate::audio::platform_backend().unwrap();
+            assert_eq!(backend.maintain(), Ok(()));
         }
 
         // Plays a quiet 440 Hz tone for one second through the voice-call output.
