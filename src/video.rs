@@ -46,6 +46,7 @@
 //! - **Software** — `video::openh264` (feature `openh264`): an H.264 encoder and decoder for tests
 //!   and the desktop.
 
+pub mod assemble;
 pub mod h264;
 pub mod packet;
 
