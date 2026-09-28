@@ -11,11 +11,12 @@ bytes = "1"
 cpal = { version = "0.18", optional = true }
 rand = "0.10"
 rtc = "0.21"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 webrtc = "0.21"
 
 [dev-dependencies]
 async-trait = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 
 [build-dependencies]
 cc = "1.5.1"
