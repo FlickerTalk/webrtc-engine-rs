@@ -132,25 +132,37 @@ impl Decoder {
 
     /// Decodes one packet.
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>, Error> {
-        let mut pcm = vec![0; MAX_DECODED_SAMPLES];
-        // SAFETY: `packet` is valid for its length and `pcm` holds MAX_DECODED_SAMPLES samples.
-        let samples = unsafe {
-            ffi::opus_decode(
-                self.state.as_ptr(),
-                packet.as_ptr(),
-                packet.len() as i32,
-                pcm.as_mut_ptr(),
-                MAX_DECODED_SAMPLES as c_int,
-                0,
-            )
-        };
-        pcm.truncate(check(samples)?);
-        Ok(pcm)
+        self.run(packet, MAX_DECODED_SAMPLES, false)
     }
 
     /// Synthesises a frame for a packet that never arrived (packet loss concealment).
     pub fn conceal(&mut self) -> Result<Vec<i16>, Error> {
-        todo!()
+        self.run(&[], FRAME_SAMPLES, false)
+    }
+
+    /// Calls `opus_decode`; an empty `packet` means "lost". `max_samples` bounds the output
+    /// and, for a lost frame, is the duration libopus must synthesise.
+    fn run(&mut self, packet: &[u8], max_samples: usize, fec: bool) -> Result<Vec<i16>, Error> {
+        let data = if packet.is_empty() {
+            std::ptr::null()
+        } else {
+            packet.as_ptr()
+        };
+        let len = i32::try_from(packet.len()).map_err(|_| Error::Opus(ffi::OPUS_BAD_ARG))?;
+        let mut pcm = vec![0; max_samples];
+        // SAFETY: `data` is null or valid for `len` bytes; `pcm` holds `max_samples` samples.
+        let samples = unsafe {
+            ffi::opus_decode(
+                self.state.as_ptr(),
+                data,
+                len,
+                pcm.as_mut_ptr(),
+                max_samples as c_int,
+                c_int::from(fec),
+            )
+        };
+        pcm.truncate(check(samples)?);
+        Ok(pcm)
     }
 
     /// Rebuilds the lost frame before `next_packet` from the redundancy (in-band FEC) it carries.
@@ -176,6 +188,7 @@ mod ffi {
     use std::ffi::c_int;
 
     pub const OPUS_OK: c_int = 0;
+    pub const OPUS_BAD_ARG: c_int = -1;
     pub const OPUS_APPLICATION_VOIP: c_int = 2048;
     pub const OPUS_SIGNAL_VOICE: i32 = 3001;
     pub const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
@@ -335,5 +348,20 @@ mod tests {
             largest <= 3 * nominal_bytes,
             "largest packet {largest} bytes"
         );
+    }
+
+    #[test]
+    fn conceal_fills_a_lost_frame_with_960_samples() {
+        let packets = encode_all(&test_signal(10));
+        let mut decoder = Decoder::new().unwrap();
+        for packet in &packets {
+            decoder.decode(packet).unwrap();
+        }
+
+        let concealed = decoder.conceal().unwrap();
+
+        assert_eq!(concealed.len(), FRAME_SAMPLES);
+        // It continues the voice rather than dropping to silence.
+        assert!(energy(&concealed) > 0.0);
     }
 }
