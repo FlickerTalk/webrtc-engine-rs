@@ -11,7 +11,8 @@ use std::ffi::{c_char, c_long, c_void};
 use std::mem::size_of;
 
 use objc2::encode::{Encode, Encoding, RefEncode};
-use objc2::runtime::AnyObject;
+use objc2::rc::Retained;
+use objc2::runtime::{AnyClass, AnyObject};
 
 use crate::video::VideoError;
 
@@ -561,6 +562,41 @@ pub(crate) fn cf_array(values: &[*const c_void]) -> Result<CfOwned<c_void>, Vide
     // SAFETY: a `Create` call hands over its reference.
     unsafe { CfOwned::from_create(array.cast_mut()) }.ok_or_else(|| backend("CFArrayCreate"))
 }
+
+/// An Objective-C class of a linked framework, by name.
+pub(crate) fn class(name: &std::ffi::CStr) -> Result<&'static AnyClass, VideoError> {
+    AnyClass::get(name).ok_or_else(|| VideoError::Backend(format!("no class {name:?}")))
+}
+
+/// An Objective-C object owned by a Rust value that moves between threads.
+#[derive(Debug)]
+pub(crate) struct Owned(Retained<AnyObject>);
+
+impl Owned {
+    pub(crate) fn new(object: Retained<AnyObject>) -> Self {
+        Self(object)
+    }
+
+    /// The object as a raw pointer, for the app's Swift code.
+    pub(crate) fn as_raw(&self) -> *mut c_void {
+        Retained::as_ptr(&self.0).cast_mut().cast()
+    }
+}
+
+impl std::ops::Deref for Owned {
+    type Target = AnyObject;
+
+    fn deref(&self) -> &AnyObject {
+        &self.0
+    }
+}
+
+// SAFETY: the objects kept here (capture sessions, inputs, outputs, layers) are used from the
+// thread that owns the Rust value, one call at a time (`&mut self` or a single owner), and are
+// documented as usable off the main thread for the calls made: `AVCaptureSession` configuration,
+// `AVSampleBufferDisplayLayer` enqueueing and flushing, and layer properties inside an explicit
+// `CATransaction`. Retain counts are atomic.
+unsafe impl Send for Owned {}
 
 /// A failed platform call, named for [`VideoError::Backend`].
 pub(crate) fn backend(call: &str) -> VideoError {
