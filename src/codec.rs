@@ -69,8 +69,11 @@ impl Encoder {
 
     /// Encodes one frame of exactly [`FRAME_SAMPLES`] samples into one Opus packet.
     pub fn encode(&mut self, frame: &[i16]) -> Result<Vec<u8>, Error> {
+        if frame.len() != FRAME_SAMPLES {
+            return Err(Error::FrameSize(frame.len()));
+        }
         let mut packet = vec![0; MAX_PACKET];
-        // SAFETY: `frame` holds FRAME_SAMPLES samples and `packet` MAX_PACKET bytes.
+        // SAFETY: `frame` holds FRAME_SAMPLES samples (checked above) and `packet` MAX_PACKET bytes.
         let len = unsafe {
             ffi::opus_encode(
                 self.state.as_ptr(),
@@ -275,5 +278,14 @@ mod tests {
 
         let rms_ratio = (energy(decoded) / energy(original)).sqrt();
         assert!((0.7..1.4).contains(&rms_ratio), "rms ratio {rms_ratio}");
+    }
+
+    #[test]
+    fn encode_rejects_a_frame_that_is_not_20_ms() {
+        let mut encoder = Encoder::new().unwrap();
+        for len in [FRAME_SAMPLES + 1, 2 * FRAME_SAMPLES, FRAME_SAMPLES - 1, 0] {
+            let frame = vec![0; len];
+            assert_eq!(encoder.encode(&frame), Err(Error::FrameSize(len)));
+        }
     }
 }
