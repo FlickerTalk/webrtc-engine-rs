@@ -166,8 +166,10 @@ impl Decoder {
     }
 
     /// Rebuilds the lost frame before `next_packet` from the redundancy (in-band FEC) it carries.
-    pub fn recover(&mut self, _next_packet: &[u8]) -> Result<Vec<i16>, Error> {
-        todo!()
+    /// Call `decode(next_packet)` afterwards to get the next frame itself. Without FEC
+    /// data in the packet, libopus falls back to concealment.
+    pub fn recover(&mut self, next_packet: &[u8]) -> Result<Vec<i16>, Error> {
+        self.run(next_packet, FRAME_SAMPLES, true)
     }
 }
 
@@ -363,5 +365,42 @@ mod tests {
         assert_eq!(concealed.len(), FRAME_SAMPLES);
         // It continues the voice rather than dropping to silence.
         assert!(energy(&concealed) > 0.0);
+    }
+
+    fn squared_error(a: &[i16], b: &[i16]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn recover_rebuilds_a_lost_frame_from_the_next_packets_fec() {
+        const LOST: usize = 20;
+        let packets = encode_all(&test_signal(LOST + 2));
+        let frame =
+            |pcm: &[i16], index: usize| pcm[index * FRAME_SAMPLES..][..FRAME_SAMPLES].to_vec();
+        // What the listener hears with no loss: the codec delay is the same on every path.
+        let expected = frame(&decode_all(&packets), LOST);
+
+        let mut with_fec = Decoder::new().unwrap();
+        let mut with_plc = Decoder::new().unwrap();
+        for packet in &packets[..LOST] {
+            with_fec.decode(packet).unwrap();
+            with_plc.decode(packet).unwrap();
+        }
+        let recovered = with_fec.recover(&packets[LOST + 1]).unwrap();
+        let concealed = with_plc.conceal().unwrap();
+
+        assert_eq!(recovered.len(), FRAME_SAMPLES);
+        let fec_error = squared_error(&recovered, &expected);
+        let silence_error = energy(&expected);
+        let plc_error = squared_error(&concealed, &expected);
+        assert!(
+            fec_error < silence_error,
+            "fec {fec_error} vs silence {silence_error}"
+        );
+        // Beating plain concealment shows the redundancy was actually decoded.
+        assert!(fec_error < plc_error, "fec {fec_error} vs plc {plc_error}");
     }
 }
