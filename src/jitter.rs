@@ -318,6 +318,16 @@ impl JitterBuffer {
         }
     }
 
+    /// The packet whose turn is next, if it is already buffered, without taking it. `None`
+    /// before playout starts.
+    ///
+    /// After a `Missing`, this is the packet right after the lost one: its in-band FEC can
+    /// rebuild the lost frame.
+    pub fn peek_next(&self) -> Option<&[u8]> {
+        let next = self.next?;
+        self.packets.get(&next).map(Vec::as_slice)
+    }
+
     /// `playout` for callers that only want frames: a missing frame and waiting both give `None`.
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         match self.playout() {
@@ -408,6 +418,33 @@ mod tests {
         assert_eq!(buffer.pop(), Some(vec![255]));
         assert_eq!(buffer.pop(), Some(vec![0]));
         assert_eq!(buffer.pop(), Some(vec![1]));
+    }
+
+    // After a loss, the decoder may rebuild the lost frame from the next packet's FEC, which
+    // it can only do if it can see that packet before its turn.
+    #[test]
+    fn peeks_at_the_packet_after_a_lost_one() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(1, vec![1]);
+        buffer.push(3, vec![3]);
+        buffer.push(4, vec![4]);
+        assert_eq!(buffer.peek_next(), None);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![1]));
+        assert_eq!(buffer.playout(), Playout::Missing);
+        assert_eq!(buffer.peek_next(), Some(&[3][..]));
+        assert_eq!(buffer.playout(), Playout::Frame(vec![3]));
+        assert_eq!(buffer.peek_next(), Some(&[4][..]));
+    }
+
+    // Two losses in a row: the packet after the first one is lost too, so there is no FEC.
+    #[test]
+    fn peeks_at_nothing_when_the_next_packet_is_missing_too() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(1, vec![1]);
+        buffer.push(4, vec![4]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![1]));
+        assert_eq!(buffer.playout(), Playout::Missing);
+        assert_eq!(buffer.peek_next(), None);
     }
 
     // A packet the network delivered twice plays once.
