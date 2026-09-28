@@ -62,9 +62,25 @@ impl Encoder {
             )
         };
         let state = NonNull::new(raw).ok_or(Error::Opus(code))?;
-        let encoder = Encoder { state };
+        let mut encoder = Encoder { state };
         check(code)?;
+        encoder.set(ffi::OPUS_SET_SIGNAL_REQUEST, ffi::OPUS_SIGNAL_VOICE)?;
+        encoder.set(ffi::OPUS_SET_BITRATE_REQUEST, BITRATE)?;
+        // In-band FEC (SILK LBRR) carries a coarse copy of the previous frame in each packet;
+        // the expected loss tells the encoder how many bits to give it.
+        encoder.set(ffi::OPUS_SET_INBAND_FEC_REQUEST, 1)?;
+        encoder.set(
+            ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+            EXPECTED_LOSS_PERCENT,
+        )?;
+        encoder.set(ffi::OPUS_SET_DTX_REQUEST, 0)?;
         Ok(encoder)
+    }
+
+    fn set(&mut self, request: c_int, value: i32) -> Result<(), Error> {
+        // SAFETY: every request passed here is a setter taking one opus_int32.
+        let code = unsafe { ffi::opus_encoder_ctl(self.state.as_ptr(), request, value) };
+        check(code).map(drop)
     }
 
     /// Encodes one frame of exactly [`FRAME_SAMPLES`] samples into one Opus packet.
@@ -161,6 +177,12 @@ mod ffi {
 
     pub const OPUS_OK: c_int = 0;
     pub const OPUS_APPLICATION_VOIP: c_int = 2048;
+    pub const OPUS_SIGNAL_VOICE: i32 = 3001;
+    pub const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
+    pub const OPUS_SET_INBAND_FEC_REQUEST: c_int = 4012;
+    pub const OPUS_SET_PACKET_LOSS_PERC_REQUEST: c_int = 4014;
+    pub const OPUS_SET_DTX_REQUEST: c_int = 4016;
+    pub const OPUS_SET_SIGNAL_REQUEST: c_int = 4024;
 
     #[repr(C)]
     pub struct OpusEncoder {
@@ -186,6 +208,7 @@ mod ffi {
             data: *mut u8,
             max_data_bytes: i32,
         ) -> i32;
+        pub fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
         pub fn opus_encoder_destroy(st: *mut OpusEncoder);
 
         pub fn opus_decoder_create(fs: i32, channels: c_int, error: *mut c_int)
@@ -287,5 +310,30 @@ mod tests {
             let frame = vec![0; len];
             assert_eq!(encoder.encode(&frame), Err(Error::FrameSize(len)));
         }
+    }
+
+    #[test]
+    fn packets_stay_within_the_target_bitrate() {
+        const FRAMES: usize = 50;
+        const FRAMES_PER_SECOND: usize = SAMPLE_RATE as usize / FRAME_SAMPLES;
+        let nominal_bytes = BITRATE as usize / 8 / FRAMES_PER_SECOND;
+
+        // Skip the first packets: the encoder is still adapting.
+        let packets = encode_all(&test_signal(FRAMES)).split_off(5);
+        let total: usize = packets.iter().map(Vec::len).sum();
+        let mean_bitrate = total * 8 * FRAMES_PER_SECOND / packets.len();
+
+        // VBR moves bits between frames, but the average must honour the target and no
+        // single packet may take more than a few frames' worth of budget.
+        let target = BITRATE as usize;
+        assert!(
+            (target / 4..=target * 5 / 4).contains(&mean_bitrate),
+            "mean bitrate {mean_bitrate}"
+        );
+        let largest = packets.iter().map(Vec::len).max().unwrap();
+        assert!(
+            largest <= 3 * nominal_bytes,
+            "largest packet {largest} bytes"
+        );
     }
 }
