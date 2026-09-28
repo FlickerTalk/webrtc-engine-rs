@@ -27,6 +27,8 @@ pub struct Stats {
     pub late: u64,
     /// Packets dropped because the same sequence was already buffered.
     pub duplicate: u64,
+    /// Packets received but thrown away unplayed: flushed by a resync, or a stray far packet.
+    pub discarded: u64,
     /// Packets stored now.
     pub depth: usize,
     /// Depth the playout aims for, in 20 ms frames.
@@ -35,6 +37,10 @@ pub struct Stats {
 
 /// Playout depth before the first frame, in 20 ms frames.
 const INITIAL_TARGET: usize = 2;
+
+/// A sequence this far from the highest one (1 s of audio) is not reordering but a restart
+/// or a long outage.
+const MAX_JUMP: i64 = 50;
 
 pub struct JitterBuffer {
     /// Keyed by extended sequence, so the order survives the 16-bit wrap.
@@ -46,6 +52,8 @@ pub struct JitterBuffer {
     playing: bool,
     target: usize,
     counts: Stats,
+    /// A far packet held until the next sequence confirms the jump.
+    suspect: Option<(u16, Vec<u8>)>,
 }
 
 impl JitterBuffer {
@@ -57,11 +65,36 @@ impl JitterBuffer {
             playing: false,
             target: INITIAL_TARGET,
             counts: Stats::default(),
+            suspect: None,
         }
     }
 
     pub fn push(&mut self, sequence: u16, payload: Vec<u8>) {
         self.counts.received += 1;
+        let far = self
+            .highest
+            .is_some_and(|highest| distance(highest, sequence).abs() > MAX_JUMP);
+        if far {
+            match self.suspect.take() {
+                Some((held_sequence, held)) if sequence == held_sequence.wrapping_add(1) => {
+                    self.resync();
+                    self.store(held_sequence, held);
+                }
+                stray => {
+                    if stray.is_some() {
+                        self.counts.discarded += 1;
+                    }
+                    self.suspect = Some((sequence, payload));
+                    return;
+                }
+            }
+        } else if self.suspect.take().is_some() {
+            self.counts.discarded += 1;
+        }
+        self.store(sequence, payload);
+    }
+
+    fn store(&mut self, sequence: u16, payload: Vec<u8>) {
         let extended = self.extend(sequence);
         if self.next.is_some_and(|next| extended < next) {
             self.counts.late += 1;
@@ -74,16 +107,19 @@ impl JitterBuffer {
         self.packets.insert(extended, payload);
     }
 
-    /// Unwraps a 16-bit sequence next to the highest one seen: as in RFC 3550, the one within
-    /// half the range (32768) is the right one, whichever side of the wrap it lands on.
+    /// Starts over from the next packet: what is buffered belongs to the old stream.
+    fn resync(&mut self) {
+        self.counts.discarded += self.packets.len() as u64;
+        self.packets.clear();
+        self.next = None;
+        self.highest = None;
+        self.playing = false;
+    }
+
     fn extend(&mut self, sequence: u16) -> i64 {
         let extended = match self.highest {
             None => i64::from(sequence),
-            Some(highest) => {
-                // Truncating to u16 then i16 is the modular distance, by design.
-                let delta = sequence.wrapping_sub(highest as u16) as i16;
-                highest + i64::from(delta)
-            }
+            Some(highest) => highest + distance(highest, sequence),
         };
         self.highest = Some(
             self.highest
@@ -137,6 +173,13 @@ impl JitterBuffer {
             Playout::Missing | Playout::Waiting => None,
         }
     }
+}
+
+/// Signed distance from `highest` to `sequence`: as in RFC 3550, the one within half the
+/// range (32768) is the right one, whichever side of the wrap it lands on.
+fn distance(highest: i64, sequence: u16) -> i64 {
+    // Truncating to u16 then i16 is the modular distance, by design.
+    i64::from(sequence.wrapping_sub(highest as u16) as i16)
 }
 
 impl Default for JitterBuffer {
@@ -252,5 +295,54 @@ mod tests {
         let stats = buffer.stats();
         assert_eq!(stats.depth, 2);
         assert_eq!(stats.target, 2);
+    }
+
+    // A sender that restarts jumps to an unrelated sequence: start over from it instead of
+    // concealing every sequence in between.
+    #[test]
+    fn resynchronises_on_a_far_jump_forward() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(1, vec![1]);
+        buffer.push(2, vec![2]);
+        buffer.push(3, vec![3]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![1]));
+        buffer.push(5000, vec![50]);
+        buffer.push(5001, vec![51]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![50]));
+        assert_eq!(buffer.playout(), Playout::Frame(vec![51]));
+        let stats = buffer.stats();
+        assert_eq!(stats.concealed, 0);
+        assert_eq!(stats.discarded, 2);
+    }
+
+    // The same for a restart that lands behind what was played: it is not a late packet.
+    #[test]
+    fn resynchronises_on_a_far_jump_backward() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(40000, vec![40]);
+        buffer.push(40001, vec![41]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![40]));
+        assert_eq!(buffer.playout(), Playout::Frame(vec![41]));
+        buffer.push(5, vec![5]);
+        buffer.push(6, vec![6]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![5]));
+        assert_eq!(buffer.playout(), Playout::Frame(vec![6]));
+        assert_eq!(buffer.stats().late, 0);
+    }
+
+    // One stray far packet is not a restart: the jump counts only when the next sequence
+    // confirms it, as in RFC 3550 A.1.
+    #[test]
+    fn ignores_a_single_stray_far_packet() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(1, vec![1]);
+        buffer.push(2, vec![2]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![1]));
+        buffer.push(30000, vec![30]);
+        buffer.push(3, vec![3]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![2]));
+        assert_eq!(buffer.playout(), Playout::Frame(vec![3]));
+        assert_eq!(buffer.playout(), Playout::Waiting);
+        assert_eq!(buffer.stats().discarded, 1);
     }
 }
