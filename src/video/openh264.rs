@@ -3,7 +3,16 @@
 //!
 //! For tests (real encoded frames) and the desktop; phones use their hardware codecs.
 
-use super::VideoError;
+use std::time::Duration;
+
+use ::openh264::encoder::{
+    BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile,
+    RateControlMode, UsageType,
+};
+use ::openh264::formats::YUVSource;
+use ::openh264::{OpenH264API, Timestamp};
+
+use super::{EncodedFrame, Rotation, VideoConfig, VideoError, clamp_bitrate};
 
 /// A picture in I420 (planar YUV 4:2:0, BT.601 limited range) in CPU memory: the format the
 /// software encoder takes and the decoder gives back.
@@ -149,6 +158,120 @@ impl I420Frame {
     }
 }
 
+/// An H.264 Constrained Baseline encoder: I420 in, one Annex-B access unit out, with the SPS and
+/// PPS ahead of every keyframe.
+///
+/// Keyframes come only when asked for ([`SoftwareEncoder::force_keyframe`]), on the first
+/// frame and when the size changes, as WebRTC expects: the receiver asks with a PLI.
+pub struct SoftwareEncoder {
+    fps: u32,
+    bitrate_bps: u32,
+    /// Built at the first frame of each size, since OpenH264 takes the size from it.
+    encoder: Option<SizedEncoder>,
+}
+
+struct SizedEncoder {
+    encoder: Encoder,
+    width: u32,
+    height: u32,
+}
+
+impl SoftwareEncoder {
+    /// An encoder for `config`'s frame rate and bitrate; the size comes from the frames.
+    pub fn new(config: VideoConfig) -> Result<Self, VideoError> {
+        if config.fps == 0 {
+            return Err(VideoError::Unsupported);
+        }
+        Ok(Self {
+            fps: config.fps,
+            bitrate_bps: clamp_bitrate(config.bitrate_bps),
+            encoder: None,
+        })
+    }
+
+    fn build(&self, width: u32, height: u32) -> Result<SizedEncoder, VideoError> {
+        let config = EncoderConfig::new()
+            .profile(Profile::Baseline)
+            .usage_type(UsageType::CameraVideoRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .bitrate(BitRate::from_bps(self.bitrate_bps))
+            .max_frame_rate(FrameRate::from_hz(self.fps as f32))
+            // A frame the rate control skips would be a hole in the stream; the frame channel
+            // already drops what the network cannot take.
+            .skip_frames(false)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(0))
+            .num_threads(1);
+        let encoder =
+            Encoder::with_api_config(OpenH264API::from_source(), config).map_err(backend)?;
+        Ok(SizedEncoder {
+            encoder,
+            width,
+            height,
+        })
+    }
+
+    /// Encodes `frame`, captured at `timestamp`. `None` when the encoder had nothing to send.
+    pub fn encode(
+        &mut self,
+        frame: &I420Frame,
+        timestamp: Duration,
+    ) -> Result<Option<EncodedFrame>, VideoError> {
+        let (width, height) = (frame.width, frame.height);
+        let sized = match self.encoder.take() {
+            Some(sized) if (sized.width, sized.height) == (width, height) => sized,
+            _ => self.build(width, height)?,
+        };
+        let sized = self.encoder.insert(sized);
+        let millis = u64::try_from(timestamp.as_millis()).unwrap_or(u64::MAX);
+        let stream = sized
+            .encoder
+            .encode_at(frame, Timestamp::from_millis(millis))
+            .map_err(backend)?;
+        let keyframe = match stream.frame_type() {
+            FrameType::IDR | FrameType::I => true,
+            FrameType::P | FrameType::IPMixed => false,
+            FrameType::Skip | FrameType::Invalid => return Ok(None),
+        };
+        let data = stream.to_vec();
+        if data.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(EncodedFrame {
+            data,
+            keyframe,
+            timestamp,
+            rotation: Rotation::Deg0,
+        }))
+    }
+}
+
+impl YUVSource for I420Frame {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width as usize, self.height as usize)
+    }
+
+    fn strides(&self) -> (usize, usize, usize) {
+        let chroma = self.width as usize / 2;
+        (self.width as usize, chroma, chroma)
+    }
+
+    fn y(&self) -> &[u8] {
+        &self.y
+    }
+
+    fn u(&self) -> &[u8] {
+        &self.u
+    }
+
+    fn v(&self) -> &[u8] {
+        &self.v
+    }
+}
+
+fn backend(error: ::openh264::Error) -> VideoError {
+    VideoError::Backend(format!("openh264: {error}"))
+}
+
 /// Bytes in the luma plane and in each chroma plane, for even, non-zero sizes.
 fn plane_sizes(width: u32, height: u32) -> Result<(usize, usize), VideoError> {
     if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
@@ -165,6 +288,86 @@ fn clamp_u8(value: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The NAL unit types in an Annex-B access unit, in order.
+    fn nal_types(data: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut zeros = 0;
+        for (at, &byte) in data.iter().enumerate() {
+            if byte == 1 && zeros >= 2 {
+                if let Some(header) = data.get(at + 1) {
+                    types.push(header & 0x1f);
+                }
+            }
+            zeros = if byte == 0 { zeros + 1 } else { 0 };
+        }
+        types
+    }
+
+    /// A textured picture with a bright square moving across it, so that consecutive frames
+    /// differ as camera frames do.
+    fn moving_pattern(width: u32, height: u32, index: u32) -> I420Frame {
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        let square = (index * 8) % width;
+        for y in 0..height {
+            for x in 0..width {
+                let inside = x >= square && x < square + 48 && y >= 40 && y < 88;
+                let texture = ((x * 7 + y * 13 + index * 3) % 32) as u8;
+                let pixel = if inside {
+                    [240, 230, 40]
+                } else {
+                    [
+                        (x * 255 / width) as u8 / 2 + texture,
+                        (y * 255 / height) as u8 / 2 + texture,
+                        96 + texture,
+                    ]
+                };
+                rgb.extend_from_slice(&pixel);
+            }
+        }
+        I420Frame::from_rgb(width, height, &rgb).unwrap()
+    }
+
+    fn encoder() -> SoftwareEncoder {
+        SoftwareEncoder::new(VideoConfig {
+            width: 320,
+            height: 240,
+            fps: 30,
+            bitrate_bps: 500_000,
+        })
+        .unwrap()
+    }
+
+    fn at(index: u32) -> Duration {
+        Duration::from_millis(u64::from(index) * 33)
+    }
+
+    #[test]
+    fn the_first_frame_is_a_keyframe_with_sps_and_pps() {
+        let mut encoder = encoder();
+        let first = encoder
+            .encode(&moving_pattern(320, 240, 0), at(0))
+            .unwrap()
+            .unwrap();
+        assert!(first.keyframe);
+        assert_eq!(first.timestamp, at(0));
+        assert_eq!(first.data[..4], [0, 0, 0, 1]);
+        let types = nal_types(&first.data);
+        assert_eq!(types[..2], [7, 8], "SPS and PPS first: {types:?}");
+        assert!(types.contains(&5), "an IDR slice: {types:?}");
+        // profile_idc 66 (Baseline) with constraint_set1: Constrained Baseline.
+        assert_eq!(first.data[5], 66);
+        assert_ne!(first.data[6] & 0x40, 0);
+
+        for index in 1..10 {
+            let next = encoder
+                .encode(&moving_pattern(320, 240, index), at(index))
+                .unwrap()
+                .unwrap();
+            assert!(!next.keyframe);
+            assert_eq!(nal_types(&next.data), [1], "a delta frame is one slice");
+        }
+    }
 
     fn flat_rgb(width: u32, height: u32, colour: [u8; 3]) -> Vec<u8> {
         colour.repeat((width * height) as usize)
