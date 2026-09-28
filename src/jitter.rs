@@ -2,6 +2,7 @@
 //! one every 20 ms.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// What the playout clock gets every 20 ms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,8 @@ pub struct Stats {
     pub depth: usize,
     /// Depth the playout aims for, in 20 ms frames.
     pub target: usize,
+    /// RFC 3550 interarrival jitter, from the arrival times given to `push_at`.
+    pub jitter: Duration,
 }
 
 /// Playout depth before the first frame, in 20 ms frames.
@@ -47,6 +50,29 @@ const MAX_JUMP: i64 = 50;
 /// when nobody drains the buffer.
 const CAPACITY: usize = 50;
 
+/// Send spacing between consecutive sequences: one 20 ms frame per packet.
+const FRAME_MS: f64 = 20.0;
+
+/// RFC 3550 interarrival jitter, in milliseconds.
+#[derive(Default)]
+struct JitterEstimate {
+    jitter_ms: f64,
+    /// Arrival minus send time of the previous packet; only differences matter, so the two
+    /// clocks need no common origin.
+    last_transit_ms: Option<f64>,
+}
+
+impl JitterEstimate {
+    fn update(&mut self, extended: i64, arrival: Duration) {
+        let transit_ms = arrival.as_secs_f64() * 1000.0 - extended as f64 * FRAME_MS;
+        if let Some(last) = self.last_transit_ms {
+            let difference = (transit_ms - last).abs();
+            self.jitter_ms += (difference - self.jitter_ms) / 16.0;
+        }
+        self.last_transit_ms = Some(transit_ms);
+    }
+}
+
 pub struct JitterBuffer {
     /// Keyed by extended sequence, so the order survives the 16-bit wrap.
     packets: BTreeMap<i64, Vec<u8>>,
@@ -59,6 +85,7 @@ pub struct JitterBuffer {
     counts: Stats,
     /// A far packet held until the next sequence confirms the jump.
     suspect: Option<(u16, Vec<u8>)>,
+    estimate: JitterEstimate,
 }
 
 impl JitterBuffer {
@@ -71,10 +98,22 @@ impl JitterBuffer {
             target: INITIAL_TARGET,
             counts: Stats::default(),
             suspect: None,
+            estimate: JitterEstimate::default(),
         }
     }
 
+    /// Stores a packet that arrived at `arrival`, on any monotonic clock of the caller's; the
+    /// arrival times drive the adaptive depth.
+    pub fn push_at(&mut self, sequence: u16, payload: Vec<u8>, arrival: Duration) {
+        self.receive(sequence, payload, Some(arrival));
+    }
+
+    /// Stores a packet without an arrival time: the depth then stays where it is.
     pub fn push(&mut self, sequence: u16, payload: Vec<u8>) {
+        self.receive(sequence, payload, None);
+    }
+
+    fn receive(&mut self, sequence: u16, payload: Vec<u8>, arrival: Option<Duration>) {
         self.counts.received += 1;
         let far = self
             .highest
@@ -83,7 +122,7 @@ impl JitterBuffer {
             match self.suspect.take() {
                 Some((held_sequence, held)) if sequence == held_sequence.wrapping_add(1) => {
                     self.resync();
-                    self.store(held_sequence, held);
+                    self.store(held_sequence, held, None);
                 }
                 stray => {
                     if stray.is_some() {
@@ -96,17 +135,21 @@ impl JitterBuffer {
         } else if self.suspect.take().is_some() {
             self.counts.discarded += 1;
         }
-        self.store(sequence, payload);
+        self.store(sequence, payload, arrival);
     }
 
-    fn store(&mut self, sequence: u16, payload: Vec<u8>) {
+    fn store(&mut self, sequence: u16, payload: Vec<u8>, arrival: Option<Duration>) {
         let extended = self.extend(sequence);
-        if self.next.is_some_and(|next| extended < next) {
-            self.counts.late += 1;
-            return;
-        }
         if self.packets.contains_key(&extended) {
             self.counts.duplicate += 1;
+            return;
+        }
+        // Late packets count too: arriving late is exactly what jitter measures.
+        if let Some(arrival) = arrival {
+            self.estimate.update(extended, arrival);
+        }
+        if self.next.is_some_and(|next| extended < next) {
+            self.counts.late += 1;
             return;
         }
         self.packets.insert(extended, payload);
@@ -144,6 +187,8 @@ impl JitterBuffer {
         Stats {
             depth: self.packets.len(),
             target: self.target,
+            jitter: Duration::try_from_secs_f64(self.estimate.jitter_ms / 1000.0)
+                .unwrap_or_default(),
             ..self.counts.clone()
         }
     }
@@ -374,5 +419,32 @@ mod tests {
         assert_eq!(stats.discarded, 9);
         assert_eq!(buffer.playout(), Playout::Frame(vec![11]));
         assert_eq!(buffer.stats().concealed, 0);
+    }
+
+    fn at(milliseconds: u64) -> Duration {
+        Duration::from_millis(milliseconds)
+    }
+
+    fn assert_jitter_ms(buffer: &JitterBuffer, expected: f64) {
+        let jitter = buffer.stats().jitter.as_secs_f64() * 1000.0;
+        assert!(
+            (jitter - expected).abs() < 1e-6,
+            "jitter {jitter} ms, expected {expected} ms"
+        );
+    }
+
+    // RFC 3550 6.4.1: J += (|D| - J) / 16, where D compares arrival spacing with send spacing
+    // (20 ms per sequence).
+    #[test]
+    fn measures_rfc_3550_interarrival_jitter() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push_at(0, vec![0], at(1000));
+        buffer.push_at(1, vec![1], at(1020));
+        buffer.push_at(2, vec![2], at(1040));
+        assert_jitter_ms(&buffer, 0.0);
+        buffer.push_at(3, vec![3], at(1070));
+        assert_jitter_ms(&buffer, 0.625);
+        buffer.push_at(4, vec![4], at(1080));
+        assert_jitter_ms(&buffer, 1.2109375);
     }
 }
