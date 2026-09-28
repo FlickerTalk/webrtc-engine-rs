@@ -55,6 +55,10 @@ pub mod packet;
 pub mod rtp;
 #[cfg(any(target_os = "ios", test))]
 pub mod ios;
+// The pure parts (Annex-B, rotation, formats) are tested on the host; the camera and the codecs
+// are Android only.
+#[cfg(any(target_os = "android", test))]
+pub mod android;
 
 use std::fmt;
 use std::sync::Arc;

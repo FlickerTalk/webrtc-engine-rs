@@ -14,7 +14,8 @@ rtc = "0.21"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 webrtc = "0.21"
 
-# dlopen/dlsym for AAudio: loaded at run time, so the library still loads on Android 7 (API 24).
+# dlopen/dlsym for the NDK libraries loaded at run time (AAudio, Camera2, MediaCodec), so the
+# library still loads on Android 7 (API 24).
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
 
