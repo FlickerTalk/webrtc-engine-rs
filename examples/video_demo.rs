@@ -1,38 +1,45 @@
-//! See the video path on a computer: the Mac's camera is encoded with OpenH264, crosses a
-//! simulated network (delay, jitter, loss), is decoded again and shown in a window, with a small
-//! self-preview in the corner. A lost frame makes the receiver ask the camera for a keyframe.
+//! See the video path on a computer: the Mac's camera is encoded with OpenH264, runs through a
+//! `VideoCall` (RTP packetisation, the simulated network with delay, jitter and loss, frame
+//! reassembly, keyframe requests and bitrate control), is decoded again and shown in a window,
+//! with a small self-preview in the corner.
 //!
 //! ```sh
 //! cargo run --release --example video_demo --features desktop -- --loss 5 --jitter 30 --delay 50
+//! cargo run --release --example video_demo --features desktop -- --source fake --seconds 10
 //! ```
 //!
-//! The window runs on the main thread (macOS requires it); the camera captures and encodes on
-//! its own thread; the simulated network, the receiver and the decoder run in the main loop.
-//! Every simulated packet is one whole frame, so a loss costs a frame (a real RTP loss costs the
-//! frame the packet belonged to).
+//! With `--source fake` there is no camera and no window: a `FakeSource` and a `FakeSink` run
+//! the same call and only the counters are printed.
 //!
-//! TODO: once `VideoCall` (`VideoSender` / `VideoReceiver`) is merged, replace the hand-made link
-//! below (`FrameLink`) with a `VideoCall` over `netsim::simulated_link`, so that the demo runs
-//! the engine's RTP packetisation, jitter buffer and PLI.
+//! The window runs on the main thread (macOS requires it); the camera captures and encodes on its
+//! own thread; the call's tasks, and the decoder inside the sink, run on a Tokio runtime.
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use webrtc_engine::netsim::{Conditions, NetworkSimulator};
-use webrtc_engine::video::desktop::{CameraSource, FrameSlot, SinkStats, VideoWindow, WindowSink};
-use webrtc_engine::video::{
-    EncodedFrame, FRAME_CHANNEL_CAPACITY, Facing, VideoConfig, VideoSink, VideoSource,
-    frame_channel,
+use webrtc_engine::netsim::{Conditions, simulated_video_link};
+use webrtc_engine::video::call::{
+    RemoteVideo, VideoCall, VideoCallConfig, VideoCallError, VideoStats, VideoTransport,
 };
+use webrtc_engine::video::desktop::{CameraSource, FrameSlot, VideoWindow, WindowSink};
+use webrtc_engine::video::fake::{FakeSink, FakeSource};
+use webrtc_engine::video::{VideoConfig, VideoSink, VideoSource};
 
 const USAGE: &str = "usage: video_demo [--loss PERCENT] [--jitter MS] [--delay MS] \
-                     [--bitrate KBITS] [--seconds S]";
+                     [--bitrate KBITS] [--seconds S] [--source camera|fake]";
 
-/// How long the receiver waits for a missing frame before calling it lost.
-const REORDER_WAIT: Duration = Duration::from_millis(80);
-/// While a keyframe is owed, how often the receiver asks again.
-const KEYFRAME_RETRY: Duration = Duration::from_millis(300);
+/// How long the fake source runs when `--seconds` is not given: it has no window to close.
+const FAKE_SECONDS: u64 = 10;
+
+/// Where the video comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Source {
+    /// The Mac's camera, shown in a window.
+    #[default]
+    Camera,
+    /// Made-up frames, no window: counters only.
+    Fake,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Options {
@@ -42,6 +49,7 @@ struct Options {
     bitrate_kbps: u32,
     /// Zero: until the window is closed.
     seconds: u64,
+    source: Source,
 }
 
 impl Default for Options {
@@ -52,6 +60,7 @@ impl Default for Options {
             delay_ms: 40,
             bitrate_kbps: VideoConfig::default().bitrate_bps / 1000,
             seconds: 0,
+            source: Source::Camera,
         }
     }
 }
@@ -63,6 +72,17 @@ impl Options {
             jitter: Duration::from_millis(self.jitter_ms),
             loss: self.loss_percent / 100.0,
             ..Conditions::default()
+        }
+    }
+
+    fn call_config(&self) -> VideoCallConfig {
+        let defaults = VideoCallConfig::default();
+        VideoCallConfig {
+            video: VideoConfig {
+                bitrate_bps: self.bitrate_kbps.saturating_mul(1000),
+                ..defaults.video
+            },
+            ..defaults
         }
     }
 }
@@ -84,228 +104,163 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--delay" => options.delay_ms = value.parse().map_err(|_| bad())?,
             "--bitrate" => options.bitrate_kbps = value.parse().map_err(|_| bad())?,
             "--seconds" => options.seconds = value.parse().map_err(|_| bad())?,
+            "--source" => {
+                options.source = match value.as_str() {
+                    "camera" => Source::Camera,
+                    "fake" => Source::Fake,
+                    _ => return Err(format!("--source: {value:?} is not camera or fake")),
+                }
+            }
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
     Ok(options)
 }
 
-/// The receiving end of the demo's link: puts the numbered frames back in order, waits a little
-/// for a missing one, then gives it up and owes a keyframe, dropping delta frames until one
-/// comes.
-#[derive(Debug, Default)]
-struct FrameLink {
-    /// Frames that arrived ahead of `next`, with their arrival time.
-    held: BTreeMap<u64, (EncodedFrame, Duration)>,
-    next: u64,
-    keyframe_owed: bool,
-    last_request: Option<Duration>,
-    counters: LinkCounters,
-}
-
-/// What the receiving end of the link did so far.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LinkCounters {
-    delivered: u64,
-    /// Frames given up as lost.
-    missing: u64,
-    /// Frames that came after they had been given up.
-    late: u64,
-    /// Delta frames dropped while a keyframe was owed.
-    skipped: u64,
-    keyframe_requests: u64,
-}
-
-impl FrameLink {
-    /// Frame `sequence` (numbered from zero by the sender) arrives at `now`.
-    fn arrive(&mut self, sequence: u64, frame: EncodedFrame, now: Duration) {
-        if sequence < self.next {
-            self.counters.late += 1;
-            return;
-        }
-        self.held.entry(sequence).or_insert((frame, now));
-    }
-
-    /// The frames ready for the decoder at `now`, in order.
-    fn ready(&mut self, now: Duration) -> Vec<EncodedFrame> {
-        let mut ready = Vec::new();
-        while let Some(entry) = self.held.first_entry() {
-            let sequence = *entry.key();
-            if sequence != self.next {
-                let (_, arrived) = entry.get();
-                if now < *arrived + REORDER_WAIT {
-                    break;
-                }
-                // Give the missing frames up: what follows references them.
-                self.counters.missing += sequence - self.next;
-                self.next = sequence;
-                self.keyframe_owed = true;
-            }
-            let (frame, _) = entry.remove();
-            self.next += 1;
-            if self.keyframe_owed && !frame.keyframe {
-                self.counters.skipped += 1;
-                continue;
-            }
-            if frame.keyframe {
-                self.keyframe_owed = false;
-                self.last_request = None;
-            }
-            self.counters.delivered += 1;
-            ready.push(frame);
-        }
-        ready
-    }
-
-    /// Whether to ask the sender for a keyframe now: when one is owed, here or by the decoder,
-    /// at most every [`KEYFRAME_RETRY`].
-    fn wants_keyframe(&mut self, decoder_needs_one: bool, now: Duration) -> bool {
-        if !(self.keyframe_owed || decoder_needs_one) {
-            return false;
-        }
-        if self
-            .last_request
-            .is_some_and(|last| now < last + KEYFRAME_RETRY)
-        {
-            return false;
-        }
-        self.last_request = Some(now);
-        self.counters.keyframe_requests += 1;
-        true
-    }
-}
-
-/// Totals at one moment, to print the difference every second.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Totals {
-    sent: u64,
-    sent_bytes: u64,
-    keyframes: u64,
-    /// Dropped by the camera's frame channel.
-    channel_dropped: u64,
-    link: LinkCounters,
-    sink: SinkStats,
-    network_lost: u64,
-}
-
-fn stats_line(second: u64, now: &Totals, before: &Totals) -> String {
-    let dropped = |totals: &Totals| {
-        totals.channel_dropped + totals.link.skipped + totals.link.late + totals.sink.dropped
+/// A video call whose frames go out over the simulated network and come back to its own sink:
+/// what the other side of a call would see of us. Must be called inside a Tokio runtime.
+fn start_call(
+    source: Box<dyn VideoSource>,
+    sink: Box<dyn VideoSink>,
+    options: &Options,
+) -> Result<VideoCall, VideoCallError> {
+    let (frames, packets, feedback) = simulated_video_link(options.conditions(), 1);
+    let transport = VideoTransport {
+        frames,
+        feedback,
+        remote: RemoteVideo::new(packets),
     };
+    VideoCall::start(source, sink, transport, options.call_config())
+}
+
+/// What happened in the last second, from two readings of the call's counters.
+fn stats_line(second: u64, now: &VideoStats, before: &VideoStats) -> String {
+    let dropped = |stats: &VideoStats| stats.source_dropped + stats.remote.dropped;
+    let requests =
+        |stats: &VideoStats| stats.remote.keyframe_requests + stats.sink_keyframe_requests;
     format!(
-        "{second:>3}s  sent {} fps, {} kbit/s | keyframes {} | received {} fps | lost {} | \
-         dropped {} | keyframe requests {} | decode errors {}",
-        now.sent - before.sent,
-        (now.sent_bytes - before.sent_bytes) * 8 / 1000,
-        now.keyframes - before.keyframes,
-        now.sink.decoded - before.sink.decoded,
-        now.network_lost - before.network_lost,
+        "{second:>3}s  sent {} fps at {} kbit/s | keyframes {} | received {} fps | dropped {} | \
+         keyframe requests {} | decode errors {}",
+        now.frames_sent - before.frames_sent,
+        now.bitrate_bps / 1000,
+        now.keyframes_sent - before.keyframes_sent,
+        now.frames_received - before.frames_received,
         dropped(now) - dropped(before),
-        now.link.keyframe_requests - before.link.keyframe_requests,
-        now.sink.errors - before.sink.errors,
+        requests(now) - requests(before),
+        now.sink_errors - before.sink_errors,
     )
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let options = parse(std::env::args().skip(1)).map_err(|error| format!("{error}\n{USAGE}"))?;
-    run(options)
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_time()
+        .build()?;
+    let _inside = runtime.enter();
+    let call = match options.source {
+        Source::Camera => {
+            // The window first, on the main thread, as macOS wants.
+            let mut window = VideoWindow::open("webrtc-engine video demo", 960, 720)?;
+            let remote = FrameSlot::new();
+            let camera = CameraSource::new();
+            let preview = camera.preview();
+            let sink = WindowSink::new(remote.clone());
+            let call = start_call(Box::new(camera), Box::new(sink), &options)?;
+            announce(&options, "Camera -> OpenH264", "OpenH264 -> window");
+            println!("Close the window or press Escape to stop.");
+            let mut printer = Printer::new();
+            let clock = Instant::now();
+            // Drawing waits for the next screen refresh: this paces the loop.
+            while window.show(&remote, Some(&preview))? {
+                printer.tick(&call, clock.elapsed());
+                if options.seconds > 0 && clock.elapsed() >= Duration::from_secs(options.seconds) {
+                    break;
+                }
+            }
+            call
+        }
+        Source::Fake => {
+            let call = start_call(
+                Box::new(FakeSource::new()),
+                Box::new(FakeSink::new()),
+                &options,
+            )?;
+            announce(&options, "FakeSource", "FakeSink");
+            let seconds = if options.seconds > 0 {
+                options.seconds
+            } else {
+                FAKE_SECONDS
+            };
+            let mut printer = Printer::new();
+            let clock = Instant::now();
+            while clock.elapsed() < Duration::from_secs(seconds) {
+                std::thread::sleep(Duration::from_millis(50));
+                printer.tick(&call, clock.elapsed());
+            }
+            call
+        }
+    };
+    let stats = runtime.block_on(call.stop());
+    println!("final: {stats:?}");
+    Ok(())
 }
 
-fn run(options: Options) -> Result<(), Box<dyn Error>> {
-    // The window first, on the main thread, as macOS wants.
-    let mut window = VideoWindow::open("webrtc-engine video demo", 960, 720)?;
-    let remote = FrameSlot::new();
-    let mut sink = WindowSink::new(remote.clone());
-    let monitor = sink.monitor();
-    sink.start()?;
-
-    let (sender, frames) = frame_channel(FRAME_CHANNEL_CAPACITY);
-    let mut camera = CameraSource::new();
-    let preview = camera.preview();
-    let config = VideoConfig {
-        bitrate_bps: options.bitrate_kbps.saturating_mul(1000),
-        ..VideoConfig::default()
-    };
-    camera.start(config, Facing::Front, sender)?;
+fn announce(options: &Options, from: &str, to: &str) {
     println!(
-        "Camera -> OpenH264 {} kbit/s -> {} ms delay, {} ms jitter, {} % loss -> OpenH264 -> \
-         window. Close the window or press Escape to stop.",
+        "{from} {} kbit/s -> VideoCall: RTP, {} ms delay, {} ms jitter, {} % loss -> {to}.",
         options.bitrate_kbps, options.delay_ms, options.jitter_ms, options.loss_percent
     );
+}
 
-    let mut network = NetworkSimulator::new(options.conditions(), 1);
-    let mut link = FrameLink::default();
-    let mut totals = Totals::default();
-    let mut printed = Totals::default();
-    let mut sequence = 0;
-    let mut second = 1;
-    let clock = Instant::now();
-    loop {
-        let now = clock.elapsed();
-        while let Ok(frame) = frames.try_recv() {
-            totals.sent += 1;
-            totals.sent_bytes += frame.data.len() as u64;
-            totals.keyframes += u64::from(frame.keyframe);
-            network.send((sequence, frame), now);
-            sequence += 1;
-        }
-        for (sequence, frame) in network.deliver(now) {
-            link.arrive(sequence, frame, now);
-        }
-        for frame in link.ready(now) {
-            // A frame that fails to decode is counted by the sink, which then owes a keyframe:
-            // asked for just below.
-            let _ = sink.push(frame);
-        }
-        if link.wants_keyframe(monitor.stats().keyframe_needed, now) {
-            camera.request_keyframe();
-        }
-        // Draws and waits for the next screen refresh: this paces the loop.
-        if !window.show(&remote, Some(&preview))? {
-            break;
-        }
-        if now >= Duration::from_secs(second) {
-            totals.channel_dropped = frames.dropped();
-            totals.link = link.counters;
-            totals.sink = monitor.stats();
-            totals.network_lost = network.stats().lost;
-            println!("{}", stats_line(second, &totals, &printed));
-            printed = totals;
-            second += 1;
-        }
-        if options.seconds > 0 && now >= Duration::from_secs(options.seconds) {
-            break;
+/// Prints a stats line once a second.
+struct Printer {
+    before: VideoStats,
+    second: u64,
+}
+
+impl Printer {
+    fn new() -> Self {
+        Self {
+            before: VideoStats::default(),
+            second: 1,
         }
     }
 
-    camera.stop()?;
-    sink.stop()?;
-    println!("final: {totals:?}");
-    Ok(())
+    fn tick(&mut self, call: &VideoCall, elapsed: Duration) {
+        if elapsed >= Duration::from_secs(self.second) {
+            let now = call.stats();
+            println!("{}", stats_line(self.second, &now, &self.before));
+            self.before = now;
+            self.second += 1;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webrtc_engine::video::Rotation;
+    use webrtc_engine::video::fake::frame_index;
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_owned).collect()
     }
 
     #[test]
-    fn without_flags_it_is_a_clean_network_until_the_window_closes() {
+    fn without_flags_it_is_the_camera_on_a_clean_network_until_the_window_closes() {
         let options = parse(args("")).unwrap();
         assert_eq!(options, Options::default());
         assert_eq!(options.seconds, 0);
         assert_eq!(options.bitrate_kbps, 800);
+        assert_eq!(options.source, Source::Camera);
         assert_eq!(options.conditions().loss, 0.0);
+        assert_eq!(options.call_config().video.bitrate_bps, 800_000);
     }
 
     #[test]
     fn reads_every_flag() {
         let options = parse(args(
-            "--loss 5 --jitter 30 --delay 80 --bitrate 400 --seconds 9",
+            "--loss 5 --jitter 30 --delay 80 --bitrate 400 --seconds 9 --source fake",
         ))
         .unwrap();
         assert_eq!(
@@ -316,12 +271,18 @@ mod tests {
                 delay_ms: 80,
                 bitrate_kbps: 400,
                 seconds: 9,
+                source: Source::Fake,
             }
         );
         let conditions = options.conditions();
         assert_eq!(conditions.loss, 0.05);
         assert_eq!(conditions.jitter, Duration::from_millis(30));
         assert_eq!(conditions.delay, Duration::from_millis(80));
+        assert_eq!(options.call_config().video.bitrate_bps, 400_000);
+        assert_eq!(
+            parse(args("--source camera")).unwrap().source,
+            Source::Camera
+        );
     }
 
     #[test]
@@ -330,98 +291,74 @@ mod tests {
         assert!(parse(args("--loss lots")).is_err());
         assert!(parse(args("--loss 150")).is_err());
         assert!(parse(args("--zoom 2")).is_err());
+        assert!(parse(args("--source phone")).is_err());
     }
 
-    fn frame(keyframe: bool, tag: u8) -> EncodedFrame {
-        EncodedFrame {
-            data: vec![0, 0, 0, 1, tag],
-            keyframe,
-            timestamp: Duration::ZERO,
-            rotation: Rotation::Deg0,
-        }
+    #[tokio::test(start_paused = true)]
+    async fn the_call_carries_the_frames_over_the_simulated_network_back_to_the_sink() {
+        let options = parse(args("--delay 50 --jitter 10")).unwrap();
+        let sink = FakeSink::new();
+        let shown = sink.probe();
+        let call = start_call(Box::new(FakeSource::new()), Box::new(sink), &options).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let stats = call.stop().await;
+
+        let shown: Vec<u32> = shown
+            .lock()
+            .unwrap()
+            .shown
+            .iter()
+            .filter_map(|frame| frame_index(&frame.data))
+            .collect();
+        assert!(shown.len() >= 50, "{stats:?}");
+        assert_eq!(shown, (0..shown.len() as u32).collect::<Vec<_>>());
+        assert_eq!(stats.sink_errors, 0);
+        assert_eq!(stats.remote.keyframe_requests, 0);
     }
 
-    fn ms(millis: u64) -> Duration {
-        Duration::from_millis(millis)
-    }
+    #[tokio::test(start_paused = true)]
+    async fn with_loss_the_receiver_asks_for_keyframes_and_shows_no_garbage() {
+        let options = parse(args("--loss 5 --delay 50")).unwrap();
+        let sink = FakeSink::new();
+        let probe = sink.probe();
+        let call = start_call(Box::new(FakeSource::new()), Box::new(sink), &options).unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let stats = call.stop().await;
 
-    fn tags(frames: Vec<EncodedFrame>) -> Vec<u8> {
-        frames.iter().map(|frame| frame.data[4]).collect()
-    }
-
-    #[test]
-    fn frames_that_arrive_out_of_order_are_put_back_in_order() {
-        let mut link = FrameLink::default();
-        link.arrive(0, frame(true, 0), ms(0));
-        link.arrive(2, frame(false, 2), ms(10));
-        assert_eq!(tags(link.ready(ms(10))), [0], "waits for frame 1");
-        link.arrive(1, frame(false, 1), ms(20));
-        assert_eq!(tags(link.ready(ms(20))), [1, 2]);
-        assert!(!link.wants_keyframe(false, ms(20)));
-        assert_eq!(link.counters.delivered, 3);
-    }
-
-    #[test]
-    fn a_frame_missing_for_too_long_is_lost_and_a_keyframe_is_owed() {
-        let mut link = FrameLink::default();
-        link.arrive(0, frame(true, 0), ms(0));
-        link.arrive(2, frame(false, 2), ms(40));
-        link.arrive(3, frame(false, 3), ms(70));
-        assert_eq!(tags(link.ready(ms(70))), [0]);
-        // Frame 1 never comes: the rest reference it, so they are dropped.
-        assert!(link.ready(ms(40) + REORDER_WAIT).is_empty());
-        assert_eq!(link.counters.missing, 1);
-        assert_eq!(link.counters.skipped, 2);
-
-        assert!(link.wants_keyframe(false, ms(130)));
-        assert!(!link.wants_keyframe(false, ms(200)), "not again so soon");
-        assert!(link.wants_keyframe(false, ms(130) + KEYFRAME_RETRY));
-        assert_eq!(link.counters.keyframe_requests, 2);
-
-        link.arrive(1, frame(false, 1), ms(500));
-        assert_eq!(link.counters.late, 1);
-        link.arrive(4, frame(false, 4), ms(510));
-        link.arrive(5, frame(true, 5), ms(520));
-        link.arrive(6, frame(false, 6), ms(530));
-        assert_eq!(tags(link.ready(ms(530))), [5, 6]);
-        assert!(!link.wants_keyframe(false, ms(2_000)));
-    }
-
-    #[test]
-    fn the_decoder_can_ask_for_a_keyframe_too() {
-        let mut link = FrameLink::default();
-        assert!(link.wants_keyframe(true, ms(0)));
-        assert!(!link.wants_keyframe(true, ms(10)));
+        assert!(stats.remote.keyframe_requests > 0, "{stats:?}");
+        assert!(stats.keyframe_requests_received > 0, "{stats:?}");
+        assert!(stats.keyframes_sent > 1, "{stats:?}");
+        assert_eq!(probe.lock().unwrap().broken, 0);
     }
 
     #[test]
     fn the_stats_line_shows_what_the_viewer_should_watch() {
-        let before = Totals {
-            sent: 30,
-            sent_bytes: 100_000,
-            keyframes: 1,
-            ..Totals::default()
+        let before = VideoStats {
+            frames_sent: 30,
+            keyframes_sent: 1,
+            frames_received: 28,
+            ..VideoStats::default()
         };
-        let mut now = before;
-        now.sent = 60;
-        now.sent_bytes = 200_000;
-        now.keyframes = 3;
-        now.channel_dropped = 2;
-        now.network_lost = 4;
-        now.link.missing = 4;
-        now.link.skipped = 5;
-        now.link.keyframe_requests = 2;
-        now.sink.decoded = 25;
+        let mut now = before.clone();
+        now.frames_sent = 60;
+        now.keyframes_sent = 3;
+        now.frames_received = 53;
+        now.bitrate_bps = 640_000;
+        now.source_dropped = 2;
+        now.remote.dropped = 5;
+        now.remote.keyframe_requests = 2;
+        now.sink_keyframe_requests = 1;
+        now.sink_errors = 1;
         let line = stats_line(7, &now, &before);
         for expected in [
             "7s",
             "sent 30 fps",
-            "800 kbit/s",
+            "640 kbit/s",
             "keyframes 2",
             "received 25 fps",
-            "lost 4",
             "dropped 7",
-            "keyframe requests 2",
+            "keyframe requests 3",
+            "decode errors 1",
         ] {
             assert!(line.contains(expected), "{expected:?} missing in {line:?}");
         }
