@@ -345,7 +345,7 @@ impl SoftwareDecoder {
     /// While a keyframe is owed, delta frames are dropped (`None`): they reference pictures the
     /// decoder does not have, and would only fail or show garbage.
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<I420Frame>, VideoError> {
-        let keyframe = nal_types(data).contains(&NAL_IDR);
+        let keyframe = super::h264::is_keyframe(data);
         if self.keyframe_needed && !keyframe {
             return Ok(None);
         }
@@ -436,25 +436,6 @@ fn backend(error: ::openh264::Error) -> VideoError {
     VideoError::Backend(format!("openh264: {error}"))
 }
 
-/// The NAL unit types in an Annex-B access unit, in order.
-fn nal_types(data: &[u8]) -> Vec<u8> {
-    let mut types = Vec::new();
-    let mut zeros = 0;
-    for (at, &byte) in data.iter().enumerate() {
-        if byte == 1
-            && zeros >= 2
-            && let Some(header) = data.get(at + 1)
-        {
-            types.push(header & 0x1f);
-        }
-        zeros = if byte == 0 { zeros + 1 } else { 0 };
-    }
-    types
-}
-
-/// The NAL unit type of an IDR slice.
-const NAL_IDR: u8 = 5;
-
 /// Bytes in the luma plane and in each chroma plane, for even, non-zero sizes.
 fn plane_sizes(width: u32, height: u32) -> Result<(usize, usize), VideoError> {
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -471,6 +452,15 @@ fn clamp_u8(value: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The NAL unit types in an Annex-B access unit, in order.
+    fn nal_types(data: &[u8]) -> Vec<u8> {
+        crate::video::h264::nal_units(data)
+            .iter()
+            .filter_map(|unit| unit.first())
+            .map(|&header| crate::video::h264::nal_type(header))
+            .collect()
+    }
 
     fn moving_pattern(width: u32, height: u32, index: u32) -> I420Frame {
         I420Frame::test_pattern(width, height, index).unwrap()
