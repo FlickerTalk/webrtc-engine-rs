@@ -364,6 +364,123 @@ pub trait VideoSink: Send {
     }
 }
 
+/// Neither a camera nor a display: what [`PlatformSource`] and [`PlatformSink`] are on a build
+/// with no video platform. It has no values, so [`platform_source`] and [`platform_sink`] can
+/// only return [`VideoError::Unsupported`] there.
+#[derive(Debug)]
+pub enum NoPlatform {}
+
+impl VideoSource for NoPlatform {
+    fn start(&mut self, _: VideoConfig, _: Facing, _: FrameSender) -> Result<(), VideoError> {
+        match *self {}
+    }
+    fn stop(&mut self) -> Result<(), VideoError> {
+        match *self {}
+    }
+    fn request_keyframe(&mut self) {
+        match *self {}
+    }
+    fn set_bitrate(&mut self, _: u32) {
+        match *self {}
+    }
+    fn switch_camera(&mut self, _: Facing) -> Result<(), VideoError> {
+        match *self {}
+    }
+}
+
+impl VideoSink for NoPlatform {
+    fn start(&mut self) -> Result<(), VideoError> {
+        match *self {}
+    }
+    fn push(&mut self, _: EncodedFrame) -> Result<(), VideoError> {
+        match *self {}
+    }
+    fn stop(&mut self) -> Result<(), VideoError> {
+        match *self {}
+    }
+}
+
+/// The camera of the platform this is built for: `ios::CameraSource` on iOS,
+/// `android::CameraSource` on Android, `desktop::CameraSource` elsewhere with the `desktop`
+/// feature, [`NoPlatform`] without any of them.
+#[cfg(target_os = "ios")]
+pub type PlatformSource = ios::CameraSource;
+#[cfg(target_os = "android")]
+pub type PlatformSource = android::CameraSource;
+#[cfg(all(
+    feature = "desktop",
+    not(any(target_os = "ios", target_os = "android"))
+))]
+pub type PlatformSource = desktop::CameraSource;
+#[cfg(not(any(target_os = "ios", target_os = "android", feature = "desktop")))]
+pub type PlatformSource = NoPlatform;
+
+/// The display of the platform this is built for: `ios::DisplaySink` on iOS,
+/// `android::DisplaySink` on Android, `desktop::WindowSink` elsewhere with the `desktop`
+/// feature, [`NoPlatform`] without any of them.
+#[cfg(target_os = "ios")]
+pub type PlatformSink = ios::DisplaySink;
+#[cfg(target_os = "android")]
+pub type PlatformSink = android::DisplaySink;
+#[cfg(all(
+    feature = "desktop",
+    not(any(target_os = "ios", target_os = "android"))
+))]
+pub type PlatformSink = desktop::WindowSink;
+#[cfg(not(any(target_os = "ios", target_os = "android", feature = "desktop")))]
+pub type PlatformSink = NoPlatform;
+
+/// The platform's camera, created stopped, as [`crate::audio::platform_backend`] gives the
+/// audio device. The concrete type, so the app can reach what only it has (the preview layer on
+/// iOS, the preview surface on Android) before boxing it for a
+/// [`VideoCall`](call::VideoCall). [`VideoError::Unsupported`] where there is no video platform.
+pub fn platform_source() -> Result<PlatformSource, VideoError> {
+    #[cfg(target_os = "ios")]
+    {
+        ios::CameraSource::new()
+    }
+    #[cfg(target_os = "android")]
+    {
+        Ok(android::CameraSource::new())
+    }
+    #[cfg(all(
+        feature = "desktop",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    {
+        Ok(desktop::CameraSource::new())
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", feature = "desktop")))]
+    {
+        Err(VideoError::Unsupported)
+    }
+}
+
+/// The platform's display, created stopped. The concrete type, so the app can reach its view
+/// (the layer on iOS, `set_surface` on Android, the picture slot on the desktop).
+/// [`VideoError::Unsupported`] where there is no video platform.
+pub fn platform_sink() -> Result<PlatformSink, VideoError> {
+    #[cfg(target_os = "ios")]
+    {
+        ios::DisplaySink::new()
+    }
+    #[cfg(target_os = "android")]
+    {
+        Ok(android::DisplaySink::new())
+    }
+    #[cfg(all(
+        feature = "desktop",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    {
+        Ok(desktop::WindowSink::new(desktop::FrameSlot::new()))
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", feature = "desktop")))]
+    {
+        Err(VideoError::Unsupported)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +619,30 @@ mod tests {
     fn a_sink_that_cannot_tell_never_asks_for_a_keyframe_by_polling() {
         let mut sink: Box<dyn VideoSink> = Box::new(Minimal);
         assert!(!sink.keyframe_needed());
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android", feature = "desktop")))]
+    #[test]
+    fn without_a_video_platform_there_is_no_camera_nor_display() {
+        assert!(matches!(platform_source(), Err(VideoError::Unsupported)));
+        assert!(matches!(platform_sink(), Err(VideoError::Unsupported)));
+    }
+
+    #[cfg(all(
+        feature = "desktop",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn the_desktop_feature_gives_the_desktop_camera_and_window_stopped() {
+        // Nothing opens a camera or a window until `start` or `VideoWindow::open`.
+        let mut source: desktop::CameraSource = platform_source().unwrap();
+        assert!(source.preview().latest().is_none());
+        assert_eq!(source.stop(), Ok(()));
+        let sink: desktop::WindowSink = platform_sink().unwrap();
+        let slot = sink.slot();
+        let mut boxed: Box<dyn VideoSink> = Box::new(sink);
+        assert_eq!(boxed.stop(), Ok(()));
+        assert!(slot.latest().is_none());
     }
 
     #[test]
