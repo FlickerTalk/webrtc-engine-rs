@@ -1,4 +1,48 @@
-//! Android backend on AAudio.
+//! Android backend on AAudio: [`AaudioBackend`] (Android only).
+//!
+//! # Streams
+//!
+//! Two shared, low-latency streams, asking for 48 kHz mono i16; whatever AAudio grants is read
+//! back and converted by the adapters (i16 or float, any rate or channel count).
+//!
+//! - Input: preset `VOICE_COMMUNICATION`, which brings the platform's echo canceller and noise
+//!   suppressor.
+//! - Output: usage `VOICE_COMMUNICATION`, content type speech, buffer of two bursts.
+//! - The input opens first with a new audio session (`AAUDIO_SESSION_ID_ALLOCATE`) and the output
+//!   joins that session, so the echo canceller pairs them. A session id rules out MMAP, so
+//!   latency is a little higher; echo cancellation is worth it.
+//!
+//! # Android versions
+//!
+//! AAudio is looked up at run time (`dlopen`), not linked: the app's minimum is Android 7
+//! (API 24), where it does not exist, and a linked `libaaudio.so` would stop the whole native
+//! library from loading there. On API 24 and 25, [`AaudioBackend::new`] returns an
+//! [`AudioError`]. On API 26 and 27, AAudio has no presets, usage or sessions: the call works
+//! without platform voice processing, and [`AaudioBackend::voice_processing`] says so.
+//!
+//! # Real time and errors
+//!
+//! The data callbacks only move samples between AAudio's buffer and the lock-free rings through
+//! the adapters: no locks, no allocation, no logging. The error callback (a device disconnected,
+//! a headset plugged in or out) only counts the error and raises a flag, since AAudio forbids
+//! closing a stream from it. The owner polls [`AaudioBackend::restart_if_needed`], which closes
+//! both streams and reopens them on the same rings.
+//!
+//! # The app's side (Kotlin) before `start`
+//!
+//! The backend does not touch the Android framework. Before Rust calls
+//! [`AudioBackend::start`](super::AudioBackend::start), the app's Kotlin code must:
+//!
+//! 1. hold the `RECORD_AUDIO` permission (without it the input stream fails to open and
+//!    `start` returns an error);
+//! 2. set `AudioManager.mode = MODE_IN_COMMUNICATION` (and pick the route: earpiece, speaker,
+//!    headset), and keep it until after [`AudioBackend::stop`](super::AudioBackend::stop);
+//! 3. for a call in the background, run the foreground service of type `microphone` (and
+//!    `phoneCall` if it uses the telecom framework) that keeps the process and the microphone
+//!    alive.
+//!
+//! [`AudioBackend::stop`](super::AudioBackend::stop) and `Drop` stop and close both streams before
+//! the adapters and the rings go; after `stop` the app can restore the audio mode.
 
 use std::ffi::c_void;
 use std::slice;
@@ -103,41 +147,42 @@ impl Processor {
         if audio.is_null() || frames == 0 {
             return;
         }
+        // SAFETY (all four): the caller guarantees `frames` frames of this processor's kind and
+        // channel count behind `audio`, used by nobody else during the call.
         match self {
             Self::Capture {
                 adapter,
-                kind,
+                kind: SampleKind::I16,
                 channels,
-            } => {
-                let len = frames.saturating_mul(*channels);
-                // SAFETY: the caller guarantees `len` samples of `kind` behind `audio`.
-                match kind {
-                    SampleKind::I16 => {
-                        adapter.push(unsafe { slice::from_raw_parts(audio.cast::<i16>(), len) })
-                    }
-                    SampleKind::F32 => {
-                        adapter.push(unsafe { slice::from_raw_parts(audio.cast::<f32>(), len) })
-                    }
-                }
-            }
+            } => adapter.push::<i16>(unsafe { buffer(audio, frames, *channels) }),
+            Self::Capture {
+                adapter,
+                kind: SampleKind::F32,
+                channels,
+            } => adapter.push::<f32>(unsafe { buffer(audio, frames, *channels) }),
             Self::Playout {
                 adapter,
-                kind,
+                kind: SampleKind::I16,
                 channels,
-            } => {
-                let len = frames.saturating_mul(*channels);
-                // SAFETY: as above, and nobody else reads or writes the buffer during the call.
-                match kind {
-                    SampleKind::I16 => {
-                        adapter.fill(unsafe { slice::from_raw_parts_mut(audio.cast::<i16>(), len) })
-                    }
-                    SampleKind::F32 => {
-                        adapter.fill(unsafe { slice::from_raw_parts_mut(audio.cast::<f32>(), len) })
-                    }
-                }
-            }
+            } => adapter.fill::<i16>(unsafe { buffer(audio, frames, *channels) }),
+            Self::Playout {
+                adapter,
+                kind: SampleKind::F32,
+                channels,
+            } => adapter.fill::<f32>(unsafe { buffer(audio, frames, *channels) }),
         }
     }
+}
+
+/// A callback's buffer as a slice of samples.
+///
+/// # Safety
+///
+/// `audio` points to `frames * channels` initialised samples of type `S`, valid and used by
+/// nobody else for `'a`.
+unsafe fn buffer<'a, S>(audio: *mut c_void, frames: usize, channels: usize) -> &'a mut [S] {
+    // SAFETY: the caller's guarantee.
+    unsafe { slice::from_raw_parts_mut(audio.cast::<S>(), frames.saturating_mul(channels)) }
 }
 
 /// The data callback's state. AAudio holds a raw pointer to it from opening the stream until
@@ -927,7 +972,7 @@ mod tests {
     // to /data/local/tmp and run it with `--ignored audio::android` from `adb shell`.
     #[cfg(target_os = "android")]
     mod device {
-        use super::super::device::{Direction, Stream};
+        use super::super::device::{Direction, SESSION_ID_ALLOCATE, Stream};
         use super::*;
         use crate::audio::{AudioBackend, audio_io};
         use crate::{FRAME_SAMPLES, Frame};
@@ -950,7 +995,7 @@ mod tests {
         #[ignore]
         fn plays_a_quiet_tone_for_one_second() {
             let health = Arc::new(StreamHealth::default());
-            let mut stream = Stream::open(Direction::Output, 0, &health).unwrap();
+            let mut stream = Stream::open(Direction::Output, SESSION_ID_ALLOCATE, &health).unwrap();
             let (format, kind) = stream.format().unwrap();
             eprintln!("output granted: {format:?} {kind:?}");
 
