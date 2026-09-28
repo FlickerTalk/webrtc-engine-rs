@@ -46,6 +46,11 @@
 //! - **Software** — `video::openh264` (feature `openh264`): an H.264 encoder and decoder for tests
 //!   and the desktop.
 
+// The pure parts (Annex-B, rotation, formats) are tested on the host; the camera and the codecs
+// are Android only.
+#[cfg(any(target_os = "android", test))]
+pub mod android;
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
