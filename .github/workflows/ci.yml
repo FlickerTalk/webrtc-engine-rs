@@ -40,6 +40,10 @@ jobs:
         env:
           # Without it clang stamps libopus with the SDK version as minimum iOS.
           IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+      - name: iOS lints (video::ios and audio::ios are iOS-only code)
+        run: cargo clippy --all-targets --target aarch64-apple-ios --locked -- -D warnings
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "15.0"
 
   android:
     runs-on: ubuntu-latest
