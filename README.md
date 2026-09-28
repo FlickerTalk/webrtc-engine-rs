@@ -23,6 +23,11 @@ Audio only, working end to end on the desktop and in tests:
   backend from `provider(_:didActivate:)`; see the module documentation. It runs in the iOS
   simulator; not tried on a phone yet.
 
+`audio::platform_backend()` returns the backend for the target (iOS, Android, or the desktop
+with the `desktop` feature). While it runs, its owner calls `AudioBackend::maintain()` about
+every 100 ms: on Android that reopens the streams after a headset is plugged in or out, and
+without it the call goes silent.
+
 Not there yet: the integration into the FlickerTalk app.
 
 ## Modules
