@@ -160,6 +160,12 @@ impl StreamHealth {
         self.restart_needed.store(true, Ordering::Release);
     }
 
+    /// Asks for a restart again, after one failed.
+    #[cfg(target_os = "android")]
+    fn request_restart(&self) {
+        self.restart_needed.store(true, Ordering::Release);
+    }
+
     /// Whether a stream died since the last call, clearing the flag.
     fn take_restart(&self) -> bool {
         self.restart_needed.swap(false, Ordering::AcqRel)
@@ -199,6 +205,552 @@ unsafe extern "C" fn on_error(_stream: *mut AAudioStream, user_data: *mut c_void
     // read through a shared reference, and it only holds atomics.
     if let Some(health) = unsafe { user_data.cast::<StreamHealth>().as_ref() } {
         health.report();
+    }
+}
+
+#[cfg(target_os = "android")]
+pub use device::AaudioBackend;
+
+#[cfg(target_os = "android")]
+mod device {
+    use std::ffi::{CStr, c_char};
+    use std::ptr::{self, NonNull};
+    use std::sync::{Arc, OnceLock};
+
+    use super::*;
+    use crate::SAMPLE_RATE;
+    use crate::audio::{AudioBackend, DeviceIo};
+
+    // Constants from `<aaudio/AAudio.h>`.
+    const OK: i32 = 0;
+    const SHARING_MODE_SHARED: i32 = 1;
+    const PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
+    const USAGE_VOICE_COMMUNICATION: i32 = 2;
+    const CONTENT_TYPE_SPEECH: i32 = 1;
+    const INPUT_PRESET_VOICE_COMMUNICATION: i32 = 7;
+    /// `AAUDIO_SESSION_ID_ALLOCATE`: a new session for the effects to attach to.
+    pub(super) const SESSION_ID_ALLOCATE: i32 = 0;
+
+    /// A stream direction (`aaudio_direction_t`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Direction {
+        Output = 0,
+        Input = 1,
+    }
+
+    /// `AAudioStreamBuilder`, opaque.
+    #[repr(C)]
+    struct AAudioStreamBuilder {
+        _private: [u8; 0],
+    }
+
+    type DataCallback =
+        unsafe extern "C" fn(*mut AAudioStream, *mut c_void, *mut c_void, i32) -> i32;
+    type ErrorCallback = unsafe extern "C" fn(*mut AAudioStream, *mut c_void, i32);
+    type BuilderSetter = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
+    type StreamCall = unsafe extern "C" fn(*mut AAudioStream) -> i32;
+
+    /// The AAudio functions, looked up at run time.
+    ///
+    /// Why not link `libaaudio.so`: the app's minimum is Android 7 (API 24), which has no
+    /// AAudio, and a missing `DT_NEEDED` library would stop the whole native library from
+    /// loading there. Looking it up turns that into an `AudioError` from `new`.
+    struct Api {
+        create_builder: unsafe extern "C" fn(*mut *mut AAudioStreamBuilder) -> i32,
+        delete_builder: unsafe extern "C" fn(*mut AAudioStreamBuilder) -> i32,
+        set_direction: BuilderSetter,
+        set_sample_rate: BuilderSetter,
+        set_channel_count: BuilderSetter,
+        set_format: BuilderSetter,
+        set_sharing_mode: BuilderSetter,
+        set_performance_mode: BuilderSetter,
+        set_data_callback:
+            unsafe extern "C" fn(*mut AAudioStreamBuilder, DataCallback, *mut c_void),
+        set_error_callback:
+            unsafe extern "C" fn(*mut AAudioStreamBuilder, ErrorCallback, *mut c_void),
+        open_stream: unsafe extern "C" fn(*mut AAudioStreamBuilder, *mut *mut AAudioStream) -> i32,
+        request_start: StreamCall,
+        request_stop: StreamCall,
+        close: StreamCall,
+        sample_rate: StreamCall,
+        channel_count: StreamCall,
+        format: StreamCall,
+        frames_per_burst: StreamCall,
+        buffer_capacity: StreamCall,
+        set_buffer_size: unsafe extern "C" fn(*mut AAudioStream, i32) -> i32,
+        result_text: unsafe extern "C" fn(i32) -> *const c_char,
+        /// Android 9 (API 28) and later: what turns on the platform's voice processing.
+        voice: Option<VoiceApi>,
+    }
+
+    struct VoiceApi {
+        set_usage: BuilderSetter,
+        set_content_type: BuilderSetter,
+        set_input_preset: BuilderSetter,
+        set_session_id: BuilderSetter,
+        session_id: StreamCall,
+    }
+
+    /// Looks up `name` in `library`.
+    ///
+    /// # Safety
+    ///
+    /// `library` is a live `dlopen` handle and `T` is the function pointer type of the C
+    /// declaration of `name`.
+    unsafe fn symbol<T: Copy>(library: *mut c_void, name: &CStr) -> Option<T> {
+        // SAFETY: `library` is live (caller) and `name` is NUL-terminated.
+        let address = unsafe { libc::dlsym(library, name.as_ptr()) };
+        if address.is_null() {
+            return None;
+        }
+        // SAFETY: `T` is a function pointer (caller), the same size as a data pointer on
+        // Android, and `address` is that function.
+        Some(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&address) })
+    }
+
+    impl Api {
+        /// AAudio, loaded once per process.
+        fn get() -> Result<&'static Api, AudioError> {
+            static API: OnceLock<Result<Api, AudioError>> = OnceLock::new();
+            API.get_or_init(Api::load).as_ref().map_err(Clone::clone)
+        }
+
+        fn load() -> Result<Api, AudioError> {
+            // SAFETY: a NUL-terminated name; the handle is never closed, so every symbol
+            // taken from it stays valid for the life of the process.
+            let library = unsafe { libc::dlopen(c"libaaudio.so".as_ptr(), libc::RTLD_NOW) };
+            if library.is_null() {
+                return Err(AudioError::Backend(
+                    "AAudio is not available: it needs Android 8.0 (API 26)".to_owned(),
+                ));
+            }
+            macro_rules! required {
+                ($name:literal) => {
+                    // SAFETY: the field this lands in has the type of the C declaration.
+                    unsafe { symbol(library, $name) }
+                        .ok_or_else(|| AudioError::Backend(format!("AAudio has no {:?}", $name)))?
+                };
+            }
+            macro_rules! optional {
+                ($name:literal) => {
+                    // SAFETY: as above.
+                    unsafe { symbol(library, $name) }
+                };
+            }
+            let voice = (|| {
+                Some(VoiceApi {
+                    set_usage: optional!(c"AAudioStreamBuilder_setUsage")?,
+                    set_content_type: optional!(c"AAudioStreamBuilder_setContentType")?,
+                    set_input_preset: optional!(c"AAudioStreamBuilder_setInputPreset")?,
+                    set_session_id: optional!(c"AAudioStreamBuilder_setSessionId")?,
+                    session_id: optional!(c"AAudioStream_getSessionId")?,
+                })
+            })();
+            Ok(Api {
+                create_builder: required!(c"AAudio_createStreamBuilder"),
+                delete_builder: required!(c"AAudioStreamBuilder_delete"),
+                set_direction: required!(c"AAudioStreamBuilder_setDirection"),
+                set_sample_rate: required!(c"AAudioStreamBuilder_setSampleRate"),
+                set_channel_count: required!(c"AAudioStreamBuilder_setChannelCount"),
+                set_format: required!(c"AAudioStreamBuilder_setFormat"),
+                set_sharing_mode: required!(c"AAudioStreamBuilder_setSharingMode"),
+                set_performance_mode: required!(c"AAudioStreamBuilder_setPerformanceMode"),
+                set_data_callback: required!(c"AAudioStreamBuilder_setDataCallback"),
+                set_error_callback: required!(c"AAudioStreamBuilder_setErrorCallback"),
+                open_stream: required!(c"AAudioStreamBuilder_openStream"),
+                request_start: required!(c"AAudioStream_requestStart"),
+                request_stop: required!(c"AAudioStream_requestStop"),
+                close: required!(c"AAudioStream_close"),
+                sample_rate: required!(c"AAudioStream_getSampleRate"),
+                channel_count: required!(c"AAudioStream_getChannelCount"),
+                format: required!(c"AAudioStream_getFormat"),
+                frames_per_burst: required!(c"AAudioStream_getFramesPerBurst"),
+                buffer_capacity: required!(c"AAudioStream_getBufferCapacityInFrames"),
+                set_buffer_size: required!(c"AAudioStream_setBufferSizeInFrames"),
+                result_text: required!(c"AAudio_convertResultToText"),
+                voice,
+            })
+        }
+
+        /// An error for a failed call, with AAudio's name for the result.
+        fn error(&self, what: &str, result: i32) -> AudioError {
+            // SAFETY: AAudio returns a static, NUL-terminated string for any value.
+            let text = unsafe { (self.result_text)(result) };
+            let name = if text.is_null() {
+                result.to_string()
+            } else {
+                // SAFETY: not null, and static and NUL-terminated as above.
+                unsafe { CStr::from_ptr(text) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            AudioError::Backend(format!("AAudio {what}: {name}"))
+        }
+    }
+
+    /// A stream builder, deleted when dropped.
+    struct Builder {
+        api: &'static Api,
+        raw: NonNull<AAudioStreamBuilder>,
+    }
+
+    impl Builder {
+        fn new(api: &'static Api) -> Result<Self, AudioError> {
+            let mut raw = ptr::null_mut();
+            // SAFETY: `raw` is a valid place for the new builder.
+            let result = unsafe { (api.create_builder)(&mut raw) };
+            match NonNull::new(raw) {
+                Some(raw) if result == OK => Ok(Self { api, raw }),
+                _ => Err(api.error("create builder", result)),
+            }
+        }
+
+        fn set(&self, setter: BuilderSetter, value: i32) {
+            // SAFETY: the builder is live until `drop`.
+            unsafe { setter(self.raw.as_ptr(), value) }
+        }
+    }
+
+    impl Drop for Builder {
+        fn drop(&mut self) {
+            // SAFETY: live and deleted once; streams opened from it do not need it.
+            unsafe { (self.api.delete_builder)(self.raw.as_ptr()) };
+        }
+    }
+
+    /// One open AAudio stream and the callback state it points to. Dropping it stops and closes
+    /// the stream first and frees the callback state after, so AAudio never sees freed memory.
+    pub(super) struct Stream {
+        api: &'static Api,
+        /// `None` once closed.
+        raw: Option<NonNull<AAudioStream>>,
+        /// From `Box::into_raw`; freed in `drop`.
+        slot: NonNull<CallbackSlot>,
+    }
+
+    // SAFETY: AAudio lets any thread but the stream's own callbacks control a stream. The slot
+    // is used by the data callback only while the stream runs, and by the owner only when it
+    // does not (before `requestStart`, after `close`).
+    unsafe impl Send for Stream {}
+
+    impl Stream {
+        /// Opens a stream, not yet started, asking for the engine's format and a voice call.
+        pub(super) fn open(
+            direction: Direction,
+            session: i32,
+            health: &Arc<StreamHealth>,
+        ) -> Result<Self, AudioError> {
+            let api = Api::get()?;
+            let builder = Builder::new(api)?;
+            builder.set(api.set_direction, direction as i32);
+            builder.set(api.set_sample_rate, SAMPLE_RATE as i32);
+            builder.set(api.set_channel_count, 1);
+            builder.set(api.set_format, FORMAT_PCM_I16);
+            builder.set(api.set_sharing_mode, SHARING_MODE_SHARED);
+            builder.set(api.set_performance_mode, PERFORMANCE_MODE_LOW_LATENCY);
+            if let Some(voice) = &api.voice {
+                match direction {
+                    Direction::Input => {
+                        builder.set(voice.set_input_preset, INPUT_PRESET_VOICE_COMMUNICATION)
+                    }
+                    Direction::Output => {
+                        builder.set(voice.set_usage, USAGE_VOICE_COMMUNICATION);
+                        builder.set(voice.set_content_type, CONTENT_TYPE_SPEECH);
+                    }
+                }
+                builder.set(voice.set_session_id, session);
+            }
+
+            let slot = NonNull::from(Box::leak(Box::<CallbackSlot>::default()));
+            // SAFETY: the builder is live; the slot lives until this stream is dropped, after
+            // the AAudio stream is closed; `health` is kept alive by the backend beyond that.
+            unsafe {
+                (api.set_data_callback)(builder.raw.as_ptr(), on_data, slot.as_ptr().cast());
+                (api.set_error_callback)(
+                    builder.raw.as_ptr(),
+                    on_error,
+                    Arc::as_ptr(health).cast_mut().cast(),
+                );
+            }
+            let mut raw = ptr::null_mut();
+            // SAFETY: the builder is live and `raw` is a valid place for the stream.
+            let result = unsafe { (api.open_stream)(builder.raw.as_ptr(), &mut raw) };
+            let stream = Self {
+                api,
+                raw: NonNull::new(raw),
+                slot,
+            };
+            if result != OK || stream.raw.is_none() {
+                return Err(api.error("open stream", result));
+            }
+            Ok(stream)
+        }
+
+        fn call(&self, function: StreamCall) -> i32 {
+            match self.raw {
+                // SAFETY: open until `shut`, which clears `raw`.
+                Some(raw) => unsafe { function(raw.as_ptr()) },
+                None => 0,
+            }
+        }
+
+        /// The format AAudio granted.
+        pub(super) fn format(&self) -> Result<(StreamFormat, SampleKind), AudioError> {
+            granted_format(
+                self.call(self.api.sample_rate),
+                self.call(self.api.channel_count),
+                self.call(self.api.format),
+            )
+        }
+
+        /// The effect session AAudio gave the stream, if it knows about sessions.
+        pub(super) fn session_id(&self) -> Option<i32> {
+            let voice = self.api.voice.as_ref()?;
+            Some(self.call(voice.session_id)).filter(|&id| id > 0)
+        }
+
+        /// Keeps the playout buffer short: two bursts.
+        pub(super) fn shorten_buffer(&self) {
+            let burst = self.call(self.api.frames_per_burst);
+            let capacity = self.call(self.api.buffer_capacity);
+            if let (Some(frames), Some(raw)) = (playout_buffer_frames(burst, capacity), self.raw) {
+                // SAFETY: the stream is open. A refusal leaves AAudio's default, which works.
+                unsafe { (self.api.set_buffer_size)(raw.as_ptr(), frames) };
+            }
+        }
+
+        /// Hands the data callback its processor, before starting.
+        pub(super) fn install(&mut self, processor: Processor) {
+            // SAFETY: not started yet (callers install first), so no callback touches the slot.
+            unsafe { (*self.slot.as_ptr()).0 = Some(processor) };
+        }
+
+        /// Starts the callbacks.
+        pub(super) fn start(&mut self) -> Result<(), AudioError> {
+            match self.call(self.api.request_start) {
+                OK => Ok(()),
+                result => Err(self.api.error("start", result)),
+            }
+        }
+
+        /// Stops and closes the AAudio stream. When it returns, no callback runs any more.
+        fn shut(&mut self) {
+            if let Some(raw) = self.raw.take() {
+                // SAFETY: open until here, and never used again. `close` stops the stream too;
+                // the explicit stop is for Android 8, where closing a running stream crashed
+                // on some devices.
+                unsafe {
+                    (self.api.request_stop)(raw.as_ptr());
+                    (self.api.close)(raw.as_ptr());
+                }
+            }
+        }
+
+        /// Stops and closes the stream, and gives the processor back.
+        pub(super) fn close(mut self) -> Option<Processor> {
+            self.shut();
+            // SAFETY: closed, so no callback uses the slot any more.
+            unsafe { (*self.slot.as_ptr()).0.take() }
+        }
+    }
+
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            self.shut();
+            // SAFETY: from `Box::leak` in `open`; the stream is closed, so AAudio holds no
+            // pointer to it any more, and it is freed only here.
+            drop(unsafe { Box::from_raw(self.slot.as_ptr()) });
+        }
+    }
+
+    /// The two streams of a running call.
+    struct Streams {
+        input: Stream,
+        output: Stream,
+    }
+
+    impl Streams {
+        /// Stops and closes both streams, then gives the rings back.
+        fn close(self) -> Option<DeviceIo> {
+            let Self { input, output } = self;
+            let input = input.close();
+            let output = output.close();
+            match (input, output) {
+                (
+                    Some(Processor::Capture {
+                        adapter: capture, ..
+                    }),
+                    Some(Processor::Playout {
+                        adapter: playout, ..
+                    }),
+                ) => Some(DeviceIo {
+                    capture: capture.into_ring(),
+                    playout: playout.into_ring(),
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    /// Android's microphone and speaker through AAudio, with the platform's voice processing.
+    ///
+    /// See the module documentation for what the app must do before [`AudioBackend::start`].
+    pub struct AaudioBackend {
+        streams: Option<Streams>,
+        /// The rings, while a restart failed and waits to be retried.
+        parked: Option<DeviceIo>,
+        /// Shared with the error callbacks of both streams; outlives them.
+        pub(super) health: Arc<StreamHealth>,
+        capture_dropped: Counter,
+        playout_underruns: Counter,
+        session_id: Option<i32>,
+        voice_processing: bool,
+    }
+
+    impl AaudioBackend {
+        /// Loads AAudio. Fails on Android 7 (API 24 and 25), which has none.
+        pub fn new() -> Result<Self, AudioError> {
+            let api = Api::get()?;
+            Ok(Self {
+                streams: None,
+                parked: None,
+                health: Arc::default(),
+                capture_dropped: Counter::default(),
+                playout_underruns: Counter::default(),
+                session_id: None,
+                voice_processing: api.voice.is_some(),
+            })
+        }
+
+        /// Whether the streams ask for the platform's voice processing (echo cancellation,
+        /// noise suppression). Only Android 9 (API 28) and later can; on 8.x the call works
+        /// without it.
+        pub fn voice_processing(&self) -> bool {
+            self.voice_processing
+        }
+
+        /// The audio session both streams share while running, for Java's `AudioEffect`s.
+        pub fn session_id(&self) -> Option<i32> {
+            self.session_id
+        }
+
+        /// Captured samples lost because the engine did not read in time, since the streams
+        /// last opened.
+        pub fn capture_dropped(&self) -> Counter {
+            self.capture_dropped.clone()
+        }
+
+        /// Speaker callbacks that played silence, since the streams last opened.
+        pub fn playout_underruns(&self) -> Counter {
+            self.playout_underruns.clone()
+        }
+
+        /// Errors AAudio reported on either stream, such as a disconnected device.
+        pub fn stream_errors(&self) -> Counter {
+            self.health.errors.clone()
+        }
+
+        /// Reopens both streams if one died (a headset plugged in or out, for example), keeping
+        /// the rings. AAudio forbids doing it from its error callback, so the owner polls this,
+        /// say every 100 ms. `Ok(true)` if it reopened. If reopening fails, the error says why,
+        /// the backend keeps the rings and the next call tries again.
+        pub fn restart_if_needed(&mut self) -> Result<bool, AudioError> {
+            if !self.health.take_restart() {
+                return Ok(false);
+            }
+            let io = self
+                .streams
+                .take()
+                .and_then(Streams::close)
+                .or_else(|| self.parked.take());
+            let Some(io) = io else {
+                return Ok(false);
+            };
+            match self.open(io) {
+                Ok(()) => Ok(true),
+                Err((error, io)) => {
+                    if io.is_some() {
+                        self.parked = io;
+                        self.health.request_restart();
+                    }
+                    Err(error)
+                }
+            }
+        }
+
+        /// Opens both streams on `io`: the input first, with a new effect session, and the
+        /// output in the same session so the echo canceller pairs them. On failure, gives the
+        /// rings back when it still has them.
+        fn open(&mut self, io: DeviceIo) -> Result<(), (AudioError, Option<DeviceIo>)> {
+            let opened = Stream::open(Direction::Input, SESSION_ID_ALLOCATE, &self.health)
+                .and_then(|input| {
+                    let session = input.session_id();
+                    let output = Stream::open(
+                        Direction::Output,
+                        session.unwrap_or(SESSION_ID_ALLOCATE),
+                        &self.health,
+                    )?;
+                    output.shorten_buffer();
+                    let input_format = input.format()?;
+                    let output_format = output.format()?;
+                    Ok((input, output, input_format, output_format, session))
+                });
+            let (input, output, (input_format, input_kind), (output_format, output_kind), session) =
+                match opened {
+                    Ok(opened) => opened,
+                    Err(error) => return Err((error, Some(io))),
+                };
+
+            // Cannot fail: `granted_format` checked the rate and the channels.
+            let adapters = CaptureAdapter::new(input_format, io.capture)
+                .and_then(|capture| Ok((capture, PlayoutAdapter::new(output_format, io.playout)?)));
+            let (capture, playout) = adapters.map_err(|error| (error, None))?;
+            self.capture_dropped = capture.dropped();
+            self.playout_underruns = playout.underruns();
+
+            let mut streams = Streams { input, output };
+            streams.input.install(Processor::Capture {
+                adapter: capture,
+                kind: input_kind,
+                channels: usize::from(input_format.channels),
+            });
+            streams.output.install(Processor::Playout {
+                adapter: playout,
+                kind: output_kind,
+                channels: usize::from(output_format.channels),
+            });
+            if let Err(error) = streams.input.start().and_then(|()| streams.output.start()) {
+                return Err((error, streams.close()));
+            }
+            self.session_id = session;
+            self.streams = Some(streams);
+            Ok(())
+        }
+    }
+
+    impl AudioBackend for AaudioBackend {
+        fn start(&mut self, io: DeviceIo) -> Result<(), AudioError> {
+            self.stop()?;
+            self.health.take_restart();
+            self.open(io).map_err(|(error, _)| error)
+        }
+
+        /// Stops and closes both streams, then drops the adapters and the rings.
+        fn stop(&mut self) -> Result<(), AudioError> {
+            if let Some(streams) = self.streams.take() {
+                drop(streams.close());
+            }
+            self.parked = None;
+            self.session_id = None;
+            Ok(())
+        }
+    }
+
+    impl Drop for AaudioBackend {
+        fn drop(&mut self) {
+            // Closes the streams before `health`, which their error callbacks point to, goes.
+            let _ = self.stop();
+        }
     }
 }
 
@@ -369,6 +921,122 @@ mod tests {
         assert_eq!(playout_buffer_frames(0, 4096), None);
         assert_eq!(playout_buffer_frames(-1, 4096), None);
         assert_eq!(playout_buffer_frames(i32::MAX, i32::MAX), Some(i32::MAX));
+    }
+
+    // On the device: `cargo test --target aarch64-linux-android --no-run`, push the test binary
+    // to /data/local/tmp and run it with `--ignored audio::android` from `adb shell`.
+    #[cfg(target_os = "android")]
+    mod device {
+        use super::super::device::{Direction, Stream};
+        use super::*;
+        use crate::audio::{AudioBackend, audio_io};
+        use crate::{FRAME_SAMPLES, Frame};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        #[test]
+        fn the_backend_can_move_to_another_thread() {
+            fn assert_send<T: Send>() {}
+            assert_send::<AaudioBackend>();
+        }
+
+        #[test]
+        fn aaudio_loads() {
+            AaudioBackend::new().unwrap();
+        }
+
+        // Plays a quiet 440 Hz tone for one second through the voice-call output.
+        #[test]
+        #[ignore]
+        fn plays_a_quiet_tone_for_one_second() {
+            let health = Arc::new(StreamHealth::default());
+            let mut stream = Stream::open(Direction::Output, 0, &health).unwrap();
+            let (format, kind) = stream.format().unwrap();
+            eprintln!("output granted: {format:?} {kind:?}");
+
+            let (mut producer, consumer) = ring(60 * FRAME_SAMPLES);
+            let tone: Vec<i16> = (0..SAMPLE_RATE as usize)
+                .map(|n| {
+                    let phase = std::f32::consts::TAU * 440.0 * n as f32 / SAMPLE_RATE as f32;
+                    (phase.sin() * 3000.0) as i16
+                })
+                .collect();
+            assert_eq!(producer.push(&tone), tone.len());
+            let adapter = PlayoutAdapter::new(format, consumer).unwrap();
+            let underruns = adapter.underruns();
+            stream.install(Processor::Playout {
+                adapter,
+                kind,
+                channels: usize::from(format.channels),
+            });
+            stream.start().unwrap();
+            std::thread::sleep(Duration::from_millis(1100));
+            assert!(stream.close().is_some());
+
+            assert!(producer.is_empty(), "{} samples left", producer.len());
+            eprintln!("underruns: {}", underruns.get());
+            assert_eq!(health.errors.get(), 0);
+        }
+
+        // Both streams through the backend. From `adb shell` the microphone may be refused.
+        #[test]
+        #[ignore]
+        fn captures_and_plays_through_the_backend() {
+            let (device, mut engine) = audio_io(16);
+            let mut backend = AaudioBackend::new().unwrap();
+            backend.start(device).unwrap();
+            assert!(backend.voice_processing());
+            assert!(backend.session_id().is_some());
+
+            let silence: Frame = [0; FRAME_SAMPLES];
+            let mut frame = [0; FRAME_SAMPLES];
+            let mut captured = 0;
+            for _ in 0..50 {
+                engine.playout.write_frame(&silence);
+                while engine.capture.read_frame(&mut frame) {
+                    captured += 1;
+                }
+                assert!(!backend.restart_if_needed().unwrap());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            eprintln!(
+                "session {:?}, {captured} frames captured, {} dropped, {} underruns, {} errors",
+                backend.session_id(),
+                backend.capture_dropped().get(),
+                backend.playout_underruns().get(),
+                backend.stream_errors().get(),
+            );
+            backend.stop().unwrap();
+            backend.stop().unwrap();
+            assert_eq!(backend.session_id(), None);
+            assert!(captured >= 30, "{captured} frames in 1 s");
+        }
+
+        // What a disconnect does, without unplugging anything: the error callback's report.
+        #[test]
+        #[ignore]
+        fn a_reported_error_reopens_both_streams_on_the_same_rings() {
+            let (device, mut engine) = audio_io(16);
+            let mut backend = AaudioBackend::new().unwrap();
+            backend.start(device).unwrap();
+            let first_session = backend.session_id();
+            assert!(!backend.restart_if_needed().unwrap());
+
+            backend.health.report();
+            assert!(backend.restart_if_needed().unwrap());
+            assert!(!backend.restart_if_needed().unwrap());
+            eprintln!("session {first_session:?} -> {:?}", backend.session_id());
+            assert!(backend.session_id().is_some());
+
+            std::thread::sleep(Duration::from_millis(500));
+            let mut frame = [0; FRAME_SAMPLES];
+            let mut captured = 0;
+            while engine.capture.read_frame(&mut frame) {
+                captured += 1;
+            }
+            assert!(captured > 0);
+            backend.stop().unwrap();
+        }
     }
 
     #[test]
