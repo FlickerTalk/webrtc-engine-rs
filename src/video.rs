@@ -336,6 +336,13 @@ pub trait VideoSource: Send {
     fn set_bitrate(&mut self, bps: u32);
     /// Moves to the other camera while running; the first frame from it is a keyframe.
     fn switch_camera(&mut self, facing: Facing) -> Result<(), VideoError>;
+    /// Whether the camera stopped for good while running (another app took it, the device or
+    /// the encoder failed): no more frames will come until the source is started again. The
+    /// engine checks it now and then and restarts the source. A source that cannot tell keeps
+    /// the default, `false`.
+    fn lost(&self) -> bool {
+        false
+    }
 }
 
 /// A platform hardware H.264 decoder with its display.
@@ -347,6 +354,14 @@ pub trait VideoSink: Send {
     fn push(&mut self, frame: EncodedFrame) -> Result<(), VideoError>;
     /// Stops decoding and clears the display. Stopping a sink that is not running does nothing.
     fn stop(&mut self) -> Result<(), VideoError>;
+    /// Whether the decoder needs a keyframe to go on (none yet, a lost frame, a decoder reset).
+    /// The engine polls it after every [`VideoSink::push`] and now and then without frames, and
+    /// asks the other side for a keyframe (a PLI, rate limited) while it says `true`. It may be
+    /// a level (true until a keyframe is decoded) or an event (cleared by the call). A sink that
+    /// reports this through [`VideoSink::push`] errors only keeps the default, `false`.
+    fn keyframe_needed(&mut self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +461,47 @@ mod tests {
         let (sender, receiver) = frame_channel(2);
         drop(receiver);
         assert_eq!(sender.try_send(frame(true, 0)), SendOutcome::Closed);
+    }
+
+    /// A source and a sink that implement only what the contract requires.
+    struct Minimal;
+
+    impl VideoSource for Minimal {
+        fn start(&mut self, _: VideoConfig, _: Facing, _: FrameSender) -> Result<(), VideoError> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<(), VideoError> {
+            Ok(())
+        }
+        fn request_keyframe(&mut self) {}
+        fn set_bitrate(&mut self, _: u32) {}
+        fn switch_camera(&mut self, _: Facing) -> Result<(), VideoError> {
+            Ok(())
+        }
+    }
+
+    impl VideoSink for Minimal {
+        fn start(&mut self) -> Result<(), VideoError> {
+            Ok(())
+        }
+        fn push(&mut self, _: EncodedFrame) -> Result<(), VideoError> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<(), VideoError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_source_that_cannot_tell_is_never_lost() {
+        let source: Box<dyn VideoSource> = Box::new(Minimal);
+        assert!(!source.lost());
+    }
+
+    #[test]
+    fn a_sink_that_cannot_tell_never_asks_for_a_keyframe_by_polling() {
+        let mut sink: Box<dyn VideoSink> = Box::new(Minimal);
+        assert!(!sink.keyframe_needed());
     }
 
     #[test]
