@@ -46,6 +46,8 @@
 //! - **Software** — `video::openh264` (feature `openh264`): an H.264 encoder and decoder for tests
 //!   and the desktop.
 
+#[cfg(feature = "desktop")]
+pub mod desktop;
 #[cfg(feature = "openh264")]
 pub mod openh264;
 
