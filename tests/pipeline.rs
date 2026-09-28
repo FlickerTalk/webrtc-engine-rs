@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use webrtc_engine::FRAME_SAMPLES;
 use webrtc_engine::audio::audio_io;
-use webrtc_engine::call::{Downlink, ReceiveStats, Uplink};
-use webrtc_engine::netsim::{Conditions, NetStats, NetworkSimulator};
+use webrtc_engine::call::{Call, CallConfig, Downlink, ReceiveStats, Uplink};
+use webrtc_engine::netsim::{Conditions, NetStats, NetworkSimulator, simulated_link};
 use webrtc_engine::rtp::AudioPacket;
 
 use common::{Alignment, align_windows, mean_correlation, test_signal};
@@ -147,4 +147,42 @@ fn a_lossy_jittery_network_is_concealed_without_underrun_storms() {
         outcome.frames_played
     );
     assert_eq!(outcome.device_underruns, 0);
+}
+
+// What the demo runs: a `Call` on Tokio tasks over the simulated link, here on Tokio's paused
+// clock with a fake device that talks into the microphone and listens to the speaker.
+#[tokio::test(start_paused = true)]
+async fn a_call_runs_over_the_simulated_link() {
+    let conditions = Conditions {
+        delay: Duration::from_millis(40),
+        jitter: Duration::from_millis(20),
+        loss: 0.05,
+        ..Conditions::default()
+    };
+    let (sender, receiver) = simulated_link(conditions, 3);
+    let (mut device, engine) = audio_io(16);
+    let call =
+        Call::start(engine, sender, receiver, CallConfig::default()).expect("the call starts");
+
+    let input = test_signal(4 * 48_000);
+    let mut output = Vec::with_capacity(input.len());
+    let mut ticker = tokio::time::interval(Duration::from_millis(10));
+    for chunk in input.chunks(FRAME_SAMPLES / 2) {
+        ticker.tick().await;
+        device.capture.push(chunk);
+        let mut played = [0i16; FRAME_SAMPLES / 2];
+        device.playout.pop(&mut played);
+        output.extend_from_slice(&played);
+    }
+    let stats = call.stop().await;
+
+    let alignments = align_windows(&input, &output, 48_000, 12_000, 8, MAX_LAG);
+    let mean = mean_correlation(&alignments);
+    eprintln!("simulated call: mean correlation {mean:.3}\n  {stats:?}");
+    assert!(mean > 0.7, "mean correlation {mean}");
+    assert!(stats.receive.decoded > 150, "{stats:?}");
+    assert!(
+        stats.receive.recovered + stats.receive.concealed > 0,
+        "{stats:?}"
+    );
 }
