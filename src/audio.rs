@@ -10,6 +10,9 @@
 //! A platform backend owns the callbacks and the adapters; the engine owns the frame ends.
 
 pub mod adapter;
+// The pure parts (format, callbacks) are tested on the host; `AaudioBackend` is Android only.
+#[cfg(any(target_os = "android", test))]
+pub mod android;
 #[cfg(feature = "desktop")]
 pub mod desktop;
 pub mod format;
