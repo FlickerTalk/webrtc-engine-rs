@@ -1,7 +1,9 @@
 //! Android video: the camera with its hardware encoder, and the hardware decoder with its
 //! surface.
 
-use super::{EncodedFrame, Rotation};
+use std::ffi::CStr;
+
+use super::{EncodedFrame, Facing, Rotation, VideoConfig, VideoError, clamp_bitrate};
 
 /// NAL unit types (H.264 table 7-1) the backend looks at.
 const NAL_IDR: u8 = 5;
@@ -388,6 +390,254 @@ impl SinkState {
     }
 }
 
+/// How the receiver rotates a frame from a camera mounted at `sensor_orientation` degrees
+/// (`SENSOR_ORIENTATION`), facing `facing`, while the screen is turned by `display` (the
+/// `Display.getRotation()` of the app). The frame is neither rotated nor mirrored.
+fn frame_rotation(sensor_orientation: i32, facing: Facing, display: Rotation) -> Rotation {
+    // In quarter turns, the sensor's rounded to the nearest one.
+    let sensor = (sensor_orientation.rem_euclid(360) + 45) / 90;
+    let display = i32::from(display.to_cvo());
+    let quarters = match facing {
+        Facing::Front => sensor + display,
+        Facing::Back => sensor - display,
+    };
+    Rotation::from_cvo(u8::try_from(quarters.rem_euclid(4)).unwrap_or(0))
+}
+
+/// `ACAMERA_LENS_FACING` to a [`Facing`]; external cameras are not picked.
+fn lens_facing(value: u8) -> Option<Facing> {
+    match value {
+        0 => Some(Facing::Front),
+        1 => Some(Facing::Back),
+        _ => None,
+    }
+}
+
+/// The output sizes for `format` in `ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS`
+/// (`format, width, height, is_input` quadruples).
+fn output_sizes(configurations: &[i32], format: i32) -> Vec<(u32, u32)> {
+    configurations
+        .chunks_exact(4)
+        .filter(|entry| entry[0] == format && entry[3] == 0)
+        .filter_map(|entry| {
+            let width = u32::try_from(entry[1]).ok().filter(|&w| w > 0)?;
+            let height = u32::try_from(entry[2]).ok().filter(|&h| h > 0)?;
+            Some((width, height))
+        })
+        .collect()
+}
+
+/// The sizes in both lists, in the order of the first.
+fn common_sizes(first: &[(u32, u32)], second: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    first
+        .iter()
+        .filter(|size| second.contains(size))
+        .copied()
+        .collect()
+}
+
+/// The size to capture: the one asked for if the camera has it; else the closest in area among
+/// those with the same aspect ratio; else the closest in area.
+fn choose_size(sizes: &[(u32, u32)], wanted: (u32, u32)) -> Option<(u32, u32)> {
+    if sizes.contains(&wanted) {
+        return Some(wanted);
+    }
+    let area = |(width, height): (u32, u32)| u64::from(width) * u64::from(height);
+    // Within 1 %: w1 / h1 against w2 / h2, cross-multiplied.
+    let same_shape = |(width, height): (u32, u32)| {
+        let a = u64::from(width) * u64::from(wanted.1);
+        let b = u64::from(wanted.0) * u64::from(height);
+        a.abs_diff(b) * 100 <= b
+    };
+    let closest = |candidates: &mut dyn Iterator<Item = (u32, u32)>| {
+        candidates.min_by_key(|&size| {
+            (
+                area(size).abs_diff(area(wanted)),
+                std::cmp::Reverse(area(size)),
+            )
+        })
+    };
+    closest(&mut sizes.iter().copied().filter(|&size| same_shape(size)))
+        .or_else(|| closest(&mut sizes.iter().copied()))
+}
+
+/// The auto-exposure frame rate range to ask for (`[min, max]` from
+/// `ACAMERA_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES`): the top as close to `fps` as there is, and
+/// the bottom near 15 fps, so exposure can stretch in a dim room without the video stuttering.
+fn choose_fps_range(ranges: &[i32], fps: u32) -> Option<[i32; 2]> {
+    let fps = i64::from(fps);
+    let floor = fps.min(15);
+    ranges
+        .chunks_exact(2)
+        .map(|range| [range[0], range[1]])
+        .min_by_key(|&[min, max]| {
+            // Some legacy HALs give the rates in thousandths.
+            let scale = if max > 1000 { 1000 } else { 1 };
+            let (min, max) = (i64::from(min / scale), i64::from(max / scale));
+            (max - fps).abs() * 100 + (min - floor).abs()
+        })
+}
+
+/// A `camera_status_t` error as a [`VideoError`].
+fn camera_error(status: i32) -> VideoError {
+    // `ACAMERA_ERROR_*` (`<camera/NdkCameraError.h>`).
+    match status {
+        // No `CAMERA` permission, or a device policy that disables the camera.
+        -10013 | -10012 => VideoError::PermissionDenied,
+        -10010 | -10011 => VideoError::Backend("camera in use by another app".to_owned()),
+        other => VideoError::Backend(format!("camera error {other}")),
+    }
+}
+
+/// A value in an `AMediaFormat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FormatValue {
+    Int(i32),
+    Str(&'static CStr),
+    Buffer(Vec<u8>),
+}
+
+type FormatEntry = (&'static CStr, FormatValue);
+
+const MIME_AVC: &CStr = c"video/avc";
+const KEY_MIME: &CStr = c"mime";
+const KEY_WIDTH: &CStr = c"width";
+const KEY_HEIGHT: &CStr = c"height";
+const KEY_COLOR_FORMAT: &CStr = c"color-format";
+const KEY_BIT_RATE: &CStr = c"bitrate";
+const KEY_BITRATE_MODE: &CStr = c"bitrate-mode";
+const KEY_FRAME_RATE: &CStr = c"frame-rate";
+const KEY_I_FRAME_INTERVAL: &CStr = c"i-frame-interval";
+const KEY_PROFILE: &CStr = c"profile";
+const KEY_LEVEL: &CStr = c"level";
+const KEY_PRIORITY: &CStr = c"priority";
+const KEY_PREPEND_HEADER_TO_SYNC_FRAMES: &CStr = c"prepend-sps-pps-to-idr-frames";
+const KEY_ROTATION: &CStr = c"rotation-degrees";
+const KEY_LOW_LATENCY: &CStr = c"low-latency";
+const KEY_CSD_0: &CStr = c"csd-0";
+const KEY_CSD_1: &CStr = c"csd-1";
+const PARAMETER_VIDEO_BITRATE: &CStr = c"video-bitrate";
+const PARAMETER_REQUEST_SYNC_FRAME: &CStr = c"request-sync";
+
+/// `COLOR_FormatSurface`: the encoder takes its frames from its input surface.
+const COLOR_FORMAT_SURFACE: i32 = 0x7F00_0789;
+/// `BITRATE_MODE_VBR` and `BITRATE_MODE_CBR`.
+const BITRATE_MODE_VBR: i32 = 1;
+const BITRATE_MODE_CBR: i32 = 2;
+/// `AVCProfileBaseline` and `AVCLevel31` (`42e01f` is Constrained Baseline at level 3.1).
+const AVC_PROFILE_BASELINE: i32 = 1;
+const AVC_LEVEL_31: i32 = 0x200;
+/// Seconds between keyframes when nothing asks for one sooner.
+const I_FRAME_INTERVAL_SECONDS: i32 = 2;
+
+/// The encoder formats to try, best first: CBR (the rate the network allows, not more), then
+/// VBR for encoders that refuse CBR, then without profile and level for encoders that refuse
+/// those. Input from a surface; `width`×`height` is the capture size.
+fn encoder_formats(width: u32, height: u32, config: &VideoConfig) -> Vec<Vec<FormatEntry>> {
+    let int = |value: u32| FormatValue::Int(i32::try_from(value).unwrap_or(i32::MAX));
+    let base = vec![
+        (KEY_MIME, FormatValue::Str(MIME_AVC)),
+        (KEY_WIDTH, int(width)),
+        (KEY_HEIGHT, int(height)),
+        (KEY_COLOR_FORMAT, FormatValue::Int(COLOR_FORMAT_SURFACE)),
+        (KEY_BIT_RATE, int(clamp_bitrate(config.bitrate_bps))),
+        (KEY_FRAME_RATE, int(config.fps)),
+        (
+            KEY_I_FRAME_INTERVAL,
+            FormatValue::Int(I_FRAME_INTERVAL_SECONDS),
+        ),
+        // 0 = real time.
+        (KEY_PRIORITY, FormatValue::Int(0)),
+        // Android 10+; older encoders ignore it, and the packager adds them anyway.
+        (KEY_PREPEND_HEADER_TO_SYNC_FRAMES, FormatValue::Int(1)),
+    ];
+    let with = |mode: i32, profile: bool| {
+        let mut format = base.clone();
+        format.push((KEY_BITRATE_MODE, FormatValue::Int(mode)));
+        if profile {
+            format.push((KEY_PROFILE, FormatValue::Int(AVC_PROFILE_BASELINE)));
+            format.push((KEY_LEVEL, FormatValue::Int(AVC_LEVEL_31)));
+        }
+        format
+    };
+    vec![
+        with(BITRATE_MODE_CBR, true),
+        with(BITRATE_MODE_VBR, true),
+        with(BITRATE_MODE_VBR, false),
+    ]
+}
+
+/// The decoder format for `params`: `csd-0` and `csd-1` hold the SPS and PPS in Annex-B, and
+/// the rotation is applied by the decoder when it renders to the surface.
+fn decoder_format(params: &StreamParams) -> Vec<FormatEntry> {
+    let int = |value: u32| FormatValue::Int(i32::try_from(value).unwrap_or(i32::MAX));
+    let annex_b = |nal: &[u8]| FormatValue::Buffer([&START_CODE[..], nal].concat());
+    vec![
+        (KEY_MIME, FormatValue::Str(MIME_AVC)),
+        (KEY_WIDTH, int(params.width)),
+        (KEY_HEIGHT, int(params.height)),
+        (
+            KEY_ROTATION,
+            FormatValue::Int(i32::from(params.rotation.degrees())),
+        ),
+        (KEY_PRIORITY, FormatValue::Int(0)),
+        // Android 11+: output each frame as soon as it is decoded.
+        (KEY_LOW_LATENCY, FormatValue::Int(1)),
+        (KEY_CSD_0, annex_b(&params.sps)),
+        (KEY_CSD_1, annex_b(&params.pps)),
+    ]
+}
+
+/// `AMediaCodec_setParameters` for a new target bitrate, clamped.
+fn bitrate_parameters(bps: u32) -> Vec<FormatEntry> {
+    let bps = i32::try_from(clamp_bitrate(bps)).unwrap_or(i32::MAX);
+    vec![(PARAMETER_VIDEO_BITRATE, FormatValue::Int(bps))]
+}
+
+/// `AMediaCodec_setParameters` to make the next frame a keyframe.
+fn keyframe_parameters() -> Vec<FormatEntry> {
+    vec![(PARAMETER_REQUEST_SYNC_FRAME, FormatValue::Int(0))]
+}
+
+/// Frames the encoder is given to honour a keyframe request before it is asked again.
+const KEYFRAME_RETRY_FRAMES: u32 = 30;
+
+/// When the encoder's drain thread asks for a keyframe: once when the channel needs one, and
+/// again only if none came out within [`KEYFRAME_RETRY_FRAMES`] frames.
+#[derive(Debug, Default)]
+struct KeyframeRequests {
+    /// Frames out since the pending request; `None` with nothing pending.
+    pending: Option<u32>,
+}
+
+impl KeyframeRequests {
+    /// Notes a request sent from elsewhere (the engine's `request_keyframe`).
+    fn requested(&mut self) {
+        self.pending = Some(0);
+    }
+
+    /// After each encoded frame: whether to ask the encoder for a keyframe now.
+    fn after_frame(&mut self, keyframe: bool, needed: bool) -> bool {
+        if keyframe {
+            self.pending = None;
+            return false;
+        }
+        if !needed {
+            return false;
+        }
+        match self.pending {
+            Some(frames) if frames + 1 < KEYFRAME_RETRY_FRAMES => {
+                self.pending = Some(frames + 1);
+                false
+            }
+            _ => {
+                self.pending = Some(0);
+                true
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +955,216 @@ mod tests {
         state.on_frame(&delta(Rotation::Deg0));
         assert_eq!(state.on_frame(&delta(Rotation::Deg90)), SinkStep::Decode);
         assert!(!state.keyframe_needed());
+    }
+
+    #[test]
+    fn a_back_camera_turns_by_its_mounting_minus_the_screen() {
+        let back = |sensor, display| frame_rotation(sensor, Facing::Back, display);
+        assert_eq!(back(90, Rotation::Deg0), Rotation::Deg90);
+        assert_eq!(back(90, Rotation::Deg90), Rotation::Deg0);
+        assert_eq!(back(90, Rotation::Deg270), Rotation::Deg180);
+        assert_eq!(back(0, Rotation::Deg90), Rotation::Deg270);
+    }
+
+    #[test]
+    fn a_front_camera_turns_by_its_mounting_plus_the_screen() {
+        let front = |sensor, display| frame_rotation(sensor, Facing::Front, display);
+        assert_eq!(front(270, Rotation::Deg0), Rotation::Deg270);
+        assert_eq!(front(270, Rotation::Deg90), Rotation::Deg0);
+        assert_eq!(front(90, Rotation::Deg180), Rotation::Deg270);
+    }
+
+    #[test]
+    fn odd_sensor_orientations_are_normalised() {
+        assert_eq!(
+            frame_rotation(-90, Facing::Back, Rotation::Deg0),
+            Rotation::Deg270
+        );
+        assert_eq!(
+            frame_rotation(450, Facing::Back, Rotation::Deg0),
+            Rotation::Deg90
+        );
+        assert_eq!(
+            frame_rotation(100, Facing::Back, Rotation::Deg0),
+            Rotation::Deg90
+        );
+    }
+
+    #[test]
+    fn lens_facings_map_to_cameras() {
+        assert_eq!(lens_facing(0), Some(Facing::Front));
+        assert_eq!(lens_facing(1), Some(Facing::Back));
+        assert_eq!(lens_facing(2), None);
+    }
+
+    #[test]
+    fn output_sizes_are_read_for_one_format() {
+        let configurations = [
+            0x22, 1280, 720, 0, //
+            0x23, 640, 480, 0, //
+            0x22, 640, 480, 1, // input
+            0x22, 640, 480, 0, //
+            0x22, 0, 480, 0, //
+            0x22, 320, // truncated
+        ];
+        assert_eq!(
+            output_sizes(&configurations, 0x22),
+            [(1280, 720), (640, 480)]
+        );
+    }
+
+    #[test]
+    fn common_sizes_keep_the_first_order() {
+        assert_eq!(
+            common_sizes(
+                &[(1280, 720), (640, 480), (320, 240)],
+                &[(320, 240), (640, 480)]
+            ),
+            [(640, 480), (320, 240)]
+        );
+    }
+
+    #[test]
+    fn the_size_asked_for_is_taken_when_there() {
+        let sizes = [(1920, 1080), (640, 480), (320, 240)];
+        assert_eq!(choose_size(&sizes, (640, 480)), Some((640, 480)));
+    }
+
+    #[test]
+    fn otherwise_the_closest_size_with_the_same_shape() {
+        let sizes = [(1920, 1080), (1280, 720), (800, 600), (320, 240)];
+        assert_eq!(choose_size(&sizes, (640, 480)), Some((800, 600)));
+    }
+
+    #[test]
+    fn otherwise_the_closest_size() {
+        let sizes = [(1920, 1080), (960, 540), (640, 360)];
+        assert_eq!(choose_size(&sizes, (640, 480)), Some((640, 360)));
+        assert_eq!(choose_size(&[], (640, 480)), None);
+    }
+
+    #[test]
+    fn the_frame_rate_range_reaches_the_rate_and_lets_exposure_stretch() {
+        let ranges = [15, 15, 7, 30, 15, 30, 30, 30, 24, 24];
+        assert_eq!(choose_fps_range(&ranges, 30), Some([15, 30]));
+        assert_eq!(choose_fps_range(&[7, 30, 30, 30], 30), Some([7, 30]));
+        assert_eq!(choose_fps_range(&ranges, 15), Some([15, 15]));
+        assert_eq!(choose_fps_range(&[], 30), None);
+    }
+
+    #[test]
+    fn legacy_ranges_in_thousandths_are_understood() {
+        let ranges = [15_000, 15_000, 15_000, 30_000, 30_000, 30_000];
+        assert_eq!(choose_fps_range(&ranges, 30), Some([15_000, 30_000]));
+    }
+
+    #[test]
+    fn a_camera_refused_by_permission_or_policy_is_permission_denied() {
+        assert_eq!(camera_error(-10013), VideoError::PermissionDenied);
+        assert_eq!(camera_error(-10012), VideoError::PermissionDenied);
+        assert!(matches!(camera_error(-10010), VideoError::Backend(_)));
+    }
+
+    #[test]
+    fn the_encoder_is_asked_for_real_time_baseline_h264_from_a_surface() {
+        let config = VideoConfig::default();
+        let formats = encoder_formats(640, 480, &config);
+        assert_eq!(formats.len(), 3);
+        assert_eq!(
+            formats[0],
+            [
+                (KEY_MIME, FormatValue::Str(MIME_AVC)),
+                (KEY_WIDTH, FormatValue::Int(640)),
+                (KEY_HEIGHT, FormatValue::Int(480)),
+                (KEY_COLOR_FORMAT, FormatValue::Int(COLOR_FORMAT_SURFACE)),
+                (KEY_BIT_RATE, FormatValue::Int(800_000)),
+                (KEY_FRAME_RATE, FormatValue::Int(30)),
+                (KEY_I_FRAME_INTERVAL, FormatValue::Int(2)),
+                (KEY_PRIORITY, FormatValue::Int(0)),
+                (KEY_PREPEND_HEADER_TO_SYNC_FRAMES, FormatValue::Int(1)),
+                (KEY_BITRATE_MODE, FormatValue::Int(BITRATE_MODE_CBR)),
+                (KEY_PROFILE, FormatValue::Int(AVC_PROFILE_BASELINE)),
+                (KEY_LEVEL, FormatValue::Int(AVC_LEVEL_31)),
+            ]
+        );
+        let mode = |format: &[FormatEntry]| {
+            format
+                .iter()
+                .find(|(key, _)| *key == KEY_BITRATE_MODE)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(mode(&formats[1]), Some(FormatValue::Int(BITRATE_MODE_VBR)));
+        assert_eq!(formats[1].len(), formats[0].len());
+        assert!(!formats[2].iter().any(|(key, _)| *key == KEY_PROFILE));
+        assert!(!formats[2].iter().any(|(key, _)| *key == KEY_LEVEL));
+    }
+
+    #[test]
+    fn the_encoder_bitrate_is_clamped() {
+        let config = VideoConfig {
+            bitrate_bps: 10_000_000,
+            ..VideoConfig::default()
+        };
+        let formats = encoder_formats(640, 480, &config);
+        assert!(formats[0].contains(&(KEY_BIT_RATE, FormatValue::Int(2_500_000))));
+        assert_eq!(
+            bitrate_parameters(1),
+            [(PARAMETER_VIDEO_BITRATE, FormatValue::Int(150_000))]
+        );
+        assert_eq!(
+            keyframe_parameters(),
+            [(PARAMETER_REQUEST_SYNC_FRAME, FormatValue::Int(0))]
+        );
+    }
+
+    #[test]
+    fn the_decoder_is_configured_from_the_keyframe() {
+        let format = decoder_format(&params(&SPS_640X480, 640, 480, Rotation::Deg270));
+        let mut csd_0 = START_CODE.to_vec();
+        csd_0.extend_from_slice(&SPS_640X480);
+        let mut csd_1 = START_CODE.to_vec();
+        csd_1.extend_from_slice(&PPS_X264);
+        assert_eq!(
+            format,
+            [
+                (KEY_MIME, FormatValue::Str(MIME_AVC)),
+                (KEY_WIDTH, FormatValue::Int(640)),
+                (KEY_HEIGHT, FormatValue::Int(480)),
+                (KEY_ROTATION, FormatValue::Int(270)),
+                (KEY_PRIORITY, FormatValue::Int(0)),
+                (KEY_LOW_LATENCY, FormatValue::Int(1)),
+                (KEY_CSD_0, FormatValue::Buffer(csd_0)),
+                (KEY_CSD_1, FormatValue::Buffer(csd_1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_needed_keyframe_is_asked_for_once() {
+        let mut requests = KeyframeRequests::default();
+        assert!(!requests.after_frame(false, false));
+        assert!(requests.after_frame(false, true));
+        assert!(!requests.after_frame(false, true));
+        // The keyframe came: the next need asks again.
+        assert!(!requests.after_frame(true, false));
+        assert!(requests.after_frame(false, true));
+    }
+
+    #[test]
+    fn a_request_that_brings_no_keyframe_is_repeated() {
+        let mut requests = KeyframeRequests::default();
+        assert!(requests.after_frame(false, true));
+        let asked: Vec<bool> = (0..KEYFRAME_RETRY_FRAMES)
+            .map(|_| requests.after_frame(false, true))
+            .collect();
+        assert_eq!(asked.iter().filter(|&&asked| asked).count(), 1);
+        assert_eq!(asked.last(), Some(&true));
+    }
+
+    #[test]
+    fn a_request_from_the_engine_counts_as_pending() {
+        let mut requests = KeyframeRequests::default();
+        requests.requested();
+        assert!(!requests.after_frame(false, true));
     }
 }
