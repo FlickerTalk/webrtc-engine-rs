@@ -8,6 +8,7 @@ repository = "https://github.com/FlickerTalk/webrtc-engine-rs"
 
 [dependencies]
 bytes = "1"
+cpal = { version = "0.18", optional = true }
 rand = "0.10"
 rtc = "0.21"
 webrtc = "0.21"
@@ -18,3 +19,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 
 [build-dependencies]
 cc = "1.5.1"
+
+[features]
+# The desktop backend (cpal), for trying the engine on a computer. Mobile builds leave it out.
+desktop = ["dep:cpal"]
+
+[[example]]
+name = "mic_echo"
+required-features = ["desktop"]
+test = true
