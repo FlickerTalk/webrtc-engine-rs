@@ -9,8 +9,10 @@ use std::time::Duration;
 /// The sink cannot reach the sender, so it raises a flag: whenever it cannot decode what comes
 /// next (the first frames of a call, a delta frame after a decode failure, a layer that the
 /// system flushed while the app was in the background) it calls for a keyframe here. The
-/// pipeline polls [`KeyframeRequests::take`] after each [`push`](crate::video::VideoSink::push)
-/// (or on a timer) and, when it returns `true`, sends the other side an RTCP PLI. Requests made
+/// pipeline (`VideoCall`, through
+/// [`VideoSink::keyframe_needed`](crate::video::VideoSink::keyframe_needed)) polls
+/// [`KeyframeRequests::take`] after each [`push`](crate::video::VideoSink::push) (and on a timer)
+/// and, when it returns `true`, sends the other side an RTCP PLI. Requests made
 /// between two polls collapse into one. The sink already spaces them out
 /// (at most one request every 500 ms of frame time while it waits), so the pipeline may send a
 /// PLI for every `true`.

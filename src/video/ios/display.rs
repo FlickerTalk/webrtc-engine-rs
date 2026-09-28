@@ -347,6 +347,12 @@ impl VideoSink for DisplaySink {
         self.formats.clear();
         Ok(())
     }
+
+    /// [`KeyframeRequests::take`]: an event, cleared by the poll. The sink spaces its requests
+    /// out already.
+    fn keyframe_needed(&mut self) -> bool {
+        self.requests.take()
+    }
 }
 
 impl Drop for DisplaySink {
@@ -507,6 +513,21 @@ mod tests {
         sink.start().unwrap();
         sink.push(frames[5].clone()).unwrap();
         assert!(requests.take());
+    }
+
+    #[test]
+    #[ignore = "needs AVFoundation: run in the iOS simulator"]
+    fn the_engine_takes_the_keyframe_request_through_the_contract() {
+        let frames = encode_synthetic(640, 480, 3);
+        let mut sink = DisplaySink::new().unwrap();
+        let sink: &mut dyn VideoSink = &mut sink;
+        sink.start().unwrap();
+        // A delta frame before any keyframe: the sink raises a request, taken once.
+        sink.push(frames[1].clone()).unwrap();
+        assert!(sink.keyframe_needed());
+        assert!(!sink.keyframe_needed(), "an event: taken by the first poll");
+        sink.push(frames[0].clone()).unwrap();
+        assert!(!sink.keyframe_needed());
     }
 
     #[test]

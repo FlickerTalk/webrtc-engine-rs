@@ -35,8 +35,10 @@
 //! portrait. The frames keep the sensor's pixels; the rotation travels in each
 //! [`EncodedFrame`](super::EncodedFrame).
 //!
-//! **Keyframes from the display side.** `DisplaySink::keyframe_requests` gives a
-//! [`KeyframeRequests`] the pipeline polls to send an RTCP PLI (see there).
+//! **Keyframes from the display side.** `VideoCall` polls the sink's
+//! [`VideoSink::keyframe_needed`](super::VideoSink::keyframe_needed), which takes the flag of the
+//! [`KeyframeRequests`] that `DisplaySink::keyframe_requests` also hands out, and sends an RTCP
+//! PLI (see there). Use one or the other: both take the same flag.
 //!
 //! **Audio session.** Nothing here touches `AVAudioSession`: it belongs to the app and CallKit.
 //!
