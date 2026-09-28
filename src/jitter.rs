@@ -46,6 +46,17 @@ const INITIAL_TARGET: usize = 2;
 /// or a long outage.
 const MAX_JUMP: i64 = 50;
 
+/// Bounds of the adaptive depth, in 20 ms frames.
+const MIN_TARGET: usize = 1;
+const MAX_TARGET: usize = 10;
+
+/// Playouts (20 ms each) of calm before the depth shrinks by one frame.
+const SHRINK_AFTER: usize = 50;
+
+/// Depth in multiples of the jitter: RFC 3550 jitter is a mean deviation, and three of them
+/// cover most delay peaks without holding every call back for the rare worst one.
+const JITTER_MARGIN: f64 = 3.0;
+
 /// Most packets kept (1 s of audio): far above the 10-frame maximum depth, so it only bites
 /// when nobody drains the buffer.
 const CAPACITY: usize = 50;
@@ -86,6 +97,10 @@ pub struct JitterBuffer {
     /// A far packet held until the next sequence confirms the jump.
     suspect: Option<(u16, Vec<u8>)>,
     estimate: JitterEstimate,
+    /// Depth the current jitter asks for; `target` follows it up at once, down slowly.
+    desired: usize,
+    /// Consecutive playouts with `desired` below `target`.
+    calm: usize,
 }
 
 impl JitterBuffer {
@@ -99,6 +114,8 @@ impl JitterBuffer {
             counts: Stats::default(),
             suspect: None,
             estimate: JitterEstimate::default(),
+            desired: INITIAL_TARGET,
+            calm: 0,
         }
     }
 
@@ -147,6 +164,12 @@ impl JitterBuffer {
         // Late packets count too: arriving late is exactly what jitter measures.
         if let Some(arrival) = arrival {
             self.estimate.update(extended, arrival);
+            self.desired = desired_depth(self.estimate.jitter_ms);
+            // Growing late costs audible gaps; growing early only costs a little delay.
+            if self.desired > self.target {
+                self.target = self.desired;
+                self.calm = 0;
+            }
         }
         if self.next.is_some_and(|next| extended < next) {
             self.counts.late += 1;
@@ -196,6 +219,7 @@ impl JitterBuffer {
 
     /// Called by the playout clock every 20 ms.
     pub fn playout(&mut self) -> Playout {
+        self.shrink_when_calm();
         if !self.playing {
             let Some((&first, _)) = self.packets.first_key_value() else {
                 return Playout::Waiting;
@@ -224,6 +248,20 @@ impl JitterBuffer {
         Playout::Missing
     }
 
+    /// Shrinks one frame per `SHRINK_AFTER` calm playouts: a network that calmed for a moment
+    /// often gets worse again, and regrowing costs gaps.
+    fn shrink_when_calm(&mut self) {
+        if self.desired >= self.target {
+            self.calm = 0;
+            return;
+        }
+        self.calm += 1;
+        if self.calm >= SHRINK_AFTER {
+            self.target -= 1;
+            self.calm = 0;
+        }
+    }
+
     /// `playout` for callers that only want frames: a missing frame and waiting both give `None`.
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         match self.playout() {
@@ -231,6 +269,12 @@ impl JitterBuffer {
             Playout::Missing | Playout::Waiting => None,
         }
     }
+}
+
+fn desired_depth(jitter_ms: f64) -> usize {
+    // The float-to-int cast saturates, and the clamp bounds whatever comes out.
+    let frames = (JITTER_MARGIN * jitter_ms / FRAME_MS).ceil() as usize;
+    frames.clamp(MIN_TARGET, MAX_TARGET)
 }
 
 /// Signed distance from `highest` to `sequence`: as in RFC 3550, the one within half the
@@ -460,5 +504,67 @@ mod tests {
         buffer.push_at(5001, vec![51], at(1060));
         buffer.push_at(5002, vec![52], at(1080));
         assert_jitter_ms(&buffer, 0.0);
+    }
+
+    /// Packets sent every 20 ms, with every odd one held back by the network for `delay_ms`,
+    /// in the order they arrive.
+    fn every_other_delayed(sequences: std::ops::Range<u16>, delay_ms: u64) -> Vec<(u16, Duration)> {
+        let mut arrivals: Vec<(u16, Duration)> = sequences
+            .map(|sequence| {
+                let delay = if sequence % 2 == 1 { delay_ms } else { 0 };
+                (sequence, at(1000 + u64::from(sequence) * 20 + delay))
+            })
+            .collect();
+        arrivals.sort_by_key(|&(_, arrival)| arrival);
+        arrivals
+    }
+
+    // A worse network deepens the buffer straight away, before the next playout.
+    #[test]
+    fn grows_the_target_fast_when_jitter_rises() {
+        let mut buffer = JitterBuffer::new();
+        for (sequence, arrival) in every_other_delayed(0..20, 60) {
+            buffer.push_at(sequence, vec![], arrival);
+        }
+        let target = buffer.stats().target;
+        assert!((4..=MAX_TARGET).contains(&target), "target {target}");
+    }
+
+    #[test]
+    fn never_grows_beyond_ten_frames() {
+        let mut buffer = JitterBuffer::new();
+        for (sequence, arrival) in every_other_delayed(0..40, 1000) {
+            buffer.push_at(sequence, vec![], arrival);
+        }
+        assert_eq!(buffer.stats().target, MAX_TARGET);
+    }
+
+    // A calm network shrinks the buffer one frame at a time, at most one per second of playout,
+    // down to a single frame.
+    #[test]
+    fn shrinks_the_target_slowly_when_the_network_calms() {
+        let mut buffer = JitterBuffer::new();
+        for (sequence, arrival) in every_other_delayed(0..40, 200) {
+            buffer.push_at(sequence, vec![], arrival);
+        }
+        let mut target = buffer.stats().target;
+        assert_eq!(target, MAX_TARGET);
+        let mut ticks_since_change = 0;
+        for sequence in 40..1000u16 {
+            buffer.push_at(sequence, vec![], at(1000 + u64::from(sequence) * 20 + 200));
+            buffer.playout();
+            ticks_since_change += 1;
+            let now = buffer.stats().target;
+            if now != target {
+                assert_eq!(now, target - 1);
+                assert!(
+                    ticks_since_change >= SHRINK_AFTER,
+                    "shrank after {ticks_since_change} ticks"
+                );
+                ticks_since_change = 0;
+                target = now;
+            }
+        }
+        assert_eq!(target, MIN_TARGET);
     }
 }
