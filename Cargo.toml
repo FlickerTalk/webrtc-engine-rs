@@ -9,6 +9,10 @@ repository = "https://github.com/FlickerTalk/webrtc-engine-rs"
 [dependencies]
 bytes = "1"
 cpal = { version = "0.18", optional = true }
+# Cisco's OpenH264 (BSD-2-Clause), compiled from source with `cc`: no cmake, no nasm on arm64.
+openh264 = { version = "0.9.8", optional = true }
+# Only for the encoder options the safe wrapper does not expose (the bitrate while running).
+openh264-sys2 = { version = "0.9.8", optional = true }
 rand = "0.10"
 rtc = "0.21"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
@@ -23,7 +27,9 @@ cc = "1.5.1"
 
 [features]
 # The desktop backend (cpal), for trying the engine on a computer. Mobile builds leave it out.
-desktop = ["dep:cpal"]
+desktop = ["dep:cpal", "openh264"]
+# Software H.264 (Constrained Baseline) encoder and decoder, for tests and the desktop.
+openh264 = ["dep:openh264", "dep:openh264-sys2"]
 
 [[example]]
 name = "mic_echo"

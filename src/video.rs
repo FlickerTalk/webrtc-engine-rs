@@ -46,6 +46,9 @@
 //! - **Software** — `video::openh264` (feature `openh264`): an H.264 encoder and decoder for tests
 //!   and the desktop.
 
+#[cfg(feature = "openh264")]
+pub mod openh264;
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
