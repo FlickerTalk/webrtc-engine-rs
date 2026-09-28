@@ -53,6 +53,8 @@ pub mod fake;
 pub mod h264;
 pub mod packet;
 pub mod rtp;
+#[cfg(any(target_os = "ios", test))]
+pub mod ios;
 
 use std::fmt;
 use std::sync::Arc;
