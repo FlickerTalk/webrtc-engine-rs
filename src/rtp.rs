@@ -77,7 +77,8 @@ pub fn opus_codec() -> RTCRtpCodec {
 /// offerer's number wins, so senders read the negotiated one instead of assuming this.
 pub const OPUS_PAYLOAD_TYPE: PayloadType = 111;
 
-/// A media engine that knows Opus and nothing else.
+/// A media engine that knows Opus for audio and H.264 (with the CVO extension) for video, and
+/// nothing else.
 pub fn media_engine() -> Result<MediaEngine, RtpError> {
     let mut engine = MediaEngine::default();
     engine.register_codec(
@@ -87,18 +88,24 @@ pub fn media_engine() -> Result<MediaEngine, RtpError> {
         },
         RtpCodecKind::Audio,
     )?;
+    crate::video::rtp::register_h264(&mut engine)?;
     Ok(engine)
 }
 
-/// A peer connection builder ready for audio calls. The caller adds the handler, the runtime,
-/// the ICE configuration and the addresses to bind.
+/// A peer connection builder ready for audio and video calls. The caller adds the handler, the
+/// runtime, the ICE configuration and the addresses to bind.
 ///
 /// It sends and answers RTCP reports: the other side's Opus encoder turns its in-band FEC on
-/// from the loss our receiver reports announce.
+/// from the loss our receiver reports announce, and our video encoder follows them too. For
+/// video it adds NACK, transport-wide congestion control feedback and the interceptor that
+/// hands keyframe requests, reports and REMB to [`crate::video::rtp::VideoSender::feedback`].
 pub fn peer_connection_builder<A: ToSocketAddrs>() -> Result<PeerConnectionBuilder<A>, RtpError> {
+    let mut engine = media_engine()?;
+    let registry = configure_rtcp_reports(Registry::new());
+    let registry = crate::video::rtp::configure_video(registry, &mut engine)?;
     Ok(PeerConnectionBuilder::new()
-        .with_media_engine(media_engine()?)
-        .with_interceptor_registry(configure_rtcp_reports(Registry::new())))
+        .with_media_engine(engine)
+        .with_interceptor_registry(registry))
 }
 
 // Fixed, not random: they only name the track inside a one-to-one call, and the description

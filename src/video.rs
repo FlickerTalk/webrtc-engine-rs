@@ -52,6 +52,7 @@ pub mod call;
 pub mod fake;
 pub mod h264;
 pub mod packet;
+pub mod rtp;
 
 use std::fmt;
 use std::sync::Arc;
