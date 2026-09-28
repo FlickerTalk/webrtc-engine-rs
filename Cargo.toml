@@ -29,3 +29,8 @@ desktop = ["dep:cpal"]
 name = "mic_echo"
 required-features = ["desktop"]
 test = true
+
+[[example]]
+name = "call_demo"
+required-features = ["desktop"]
+test = true
