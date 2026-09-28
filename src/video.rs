@@ -25,9 +25,27 @@
 //! - Before encoding each frame the source checks [`FrameSender::keyframe_needed`] and, if set,
 //!   forces a keyframe (the same as [`VideoSource::request_keyframe`]).
 //!
-//! # Platform attach points (planned, not in this crate yet)
+//! # The engine side
+//!
+//! [`call::VideoCall`] runs a source and a sink against the network: RTP packetisation
+//! ([`packet`]), reassembly ([`assemble`]), keyframe requests and bitrate control ([`bitrate`]),
+//! over webrtc-rs tracks ([`rtp`]) or the simulated link of [`crate::netsim`]. Besides the frames,
+//! it polls two things of the platform code, both default methods that a platform may leave out:
+//!
+//! - [`VideoSink::keyframe_needed`]: the decoder cannot go on without a keyframe. The call sends
+//!   the other side a PLI, at most once every
+//!   [`KEYFRAME_REQUEST_INTERVAL`](assemble::KEYFRAME_REQUEST_INTERVAL).
+//! - [`VideoSource::lost`]: the camera stopped for good (another app took it). The call starts
+//!   the source again, at most once every
+//!   [`CAMERA_RESTART_INTERVAL`](call::CAMERA_RESTART_INTERVAL), and says so in its stats
+//!   (`camera_lost`, `camera_restarts`).
+//!
+//! # Platform attach points
 //!
 //! The app's UI code only ever sees native view objects; it never gets pixels.
+//! [`platform_source`] and [`platform_sink`] give the camera and the display of the platform
+//! the crate is built for, as their concrete types ([`PlatformSource`], [`PlatformSink`]), so the
+//! app can reach their views before boxing them for a [`call::VideoCall`].
 //!
 //! - **iOS** — `video::ios::{CameraSource, DisplaySink}` (AVFoundation + VideoToolbox).
 //!   `CameraSource` exposes its `AVCaptureVideoPreviewLayer` (local preview) and `DisplaySink`
@@ -35,16 +53,22 @@
 //!   pointer stays owned by the Rust object and is valid until that object is dropped; the app's
 //!   Swift code adds it as a sublayer of its view (on the main thread) and removes it before
 //!   dropping the object. Rotation is applied as the layer's transform.
-//! - **Android** — `video::android::{CameraSource, DisplaySink}` (Camera2 + MediaCodec). The app's
-//!   Kotlin code hands a `Surface` over JNI, turned into an `ANativeWindow` with
-//!   `ANativeWindow_fromSurface`: `DisplaySink::set_surface` renders the remote video there (the
-//!   decoder outputs straight to it) and `CameraSource::set_preview_surface` shows the local
-//!   preview. Passing `None` detaches the window: the app must do it in `surfaceDestroyed`. Frames
-//!   that arrive without a surface are decoded and dropped, so the decoder keeps its references.
-//! - **Desktop** — `video::desktop::{CameraSource, WindowSink}` (feature `desktop`): a camera
-//!   and a window, for trying calls on a computer.
-//! - **Software** — `video::openh264` (feature `openh264`): an H.264 encoder and decoder for tests
-//!   and the desktop.
+//! - **Android** — `video::android::{CameraSource, DisplaySink}` (Camera2 + MediaCodec, loaded
+//!   with `dlopen`; capture needs Android 8.0). The app's Kotlin code hands a `Surface` over JNI,
+//!   turned into an `ANativeWindow` with `ANativeWindow_fromSurface`: `DisplaySink::set_surface`
+//!   renders the remote video there (the decoder outputs straight to it) and
+//!   `CameraSource::set_preview_surface` shows the local preview. Passing `None` detaches the
+//!   window: the app must do it in `surfaceDestroyed`. Frames that arrive without a surface are
+//!   decoded and dropped, so the decoder keeps its references.
+//! - **Desktop** — `video::desktop::{CameraSource, WindowSink, VideoWindow}` (feature
+//!   `desktop`): the camera through nokhwa, encoded with OpenH264, and a minifb window, for
+//!   trying calls on a computer (`examples/video_demo.rs`).
+//! - **Software** — `video::openh264` (feature `openh264`): an H.264 encoder and decoder
+//!   (OpenH264, built from source) for tests and the desktop.
+//!
+//! The platform code shares [`h264`] (start code, NAL unit types, Annex-B splitting, keyframe
+//! detection); what only one platform needs stays with it (AVCC for CoreMedia on iOS, AVCC and
+//! the SPS reader for MediaCodec on Android).
 
 pub mod assemble;
 pub mod bitrate;

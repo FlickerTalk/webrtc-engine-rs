@@ -8,6 +8,11 @@
 //! [`FrameSource`]: webrtc-rs tracks (`video::rtp`) or the simulated link of
 //! [`crate::netsim`]. It is independent of the audio [`crate::call::Call`]: both can run on the
 //! same peer connection.
+//!
+//! It also polls the platform code: a sink that says it needs a keyframe
+//! ([`VideoSink::keyframe_needed`]) gets one asked for, at most every
+//! [`KEYFRAME_REQUEST_INTERVAL`]; a camera that is lost ([`VideoSource::lost`]) is started again,
+//! at most every [`CAMERA_RESTART_INTERVAL`].
 
 use std::fmt;
 use std::future::Future;
