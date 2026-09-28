@@ -28,8 +28,8 @@ pub struct Stats {
     pub late: u64,
     /// Packets dropped because the same sequence was already buffered.
     pub duplicate: u64,
-    /// Packets received but thrown away unplayed: over capacity, flushed by a resync, or a stray
-    /// far packet.
+    /// Packets received but thrown away unplayed: over capacity, drained to cut delay, flushed
+    /// by a resync, or a stray far packet.
     pub discarded: u64,
     /// Packets stored now.
     pub depth: usize,
@@ -101,6 +101,8 @@ pub struct JitterBuffer {
     desired: usize,
     /// Consecutive playouts with `desired` below `target`.
     calm: usize,
+    /// Consecutive playouts that left more packets than `target`.
+    above: usize,
 }
 
 impl JitterBuffer {
@@ -116,6 +118,7 @@ impl JitterBuffer {
             estimate: JitterEstimate::default(),
             desired: INITIAL_TARGET,
             calm: 0,
+            above: 0,
         }
     }
 
@@ -176,9 +179,13 @@ impl JitterBuffer {
             return;
         }
         self.packets.insert(extended, payload);
-        if self.packets.len() > CAPACITY
-            && let Some((oldest, _)) = self.packets.pop_first()
-        {
+        if self.packets.len() > CAPACITY {
+            self.drop_oldest();
+        }
+    }
+
+    fn drop_oldest(&mut self) {
+        if let Some((oldest, _)) = self.packets.pop_first() {
             self.counts.discarded += 1;
             // Its turn is gone: a copy arriving later is late, not a hole to conceal.
             self.next = self.next.map(|next| next.max(oldest + 1));
@@ -220,6 +227,16 @@ impl JitterBuffer {
     /// Called by the playout clock every 20 ms.
     pub fn playout(&mut self) -> Playout {
         self.shrink_when_calm();
+        let playout = self.take_next();
+        if self.playing {
+            self.drain_above_target();
+        } else {
+            self.above = 0;
+        }
+        playout
+    }
+
+    fn take_next(&mut self) -> Playout {
         if !self.playing {
             let Some((&first, _)) = self.packets.first_key_value() else {
                 return Playout::Waiting;
@@ -259,6 +276,21 @@ impl JitterBuffer {
         if self.calm >= SHRINK_AFTER {
             self.target -= 1;
             self.calm = 0;
+        }
+    }
+
+    /// Drops one frame after the depth stayed above the target for `SHRINK_AFTER` playouts:
+    /// that excess never absorbed any jitter, it only added delay. A shorter excursion is jitter
+    /// being absorbed, and dropping it would cause the very gap the buffer is there to prevent.
+    fn drain_above_target(&mut self) {
+        if self.packets.len() <= self.target {
+            self.above = 0;
+            return;
+        }
+        self.above += 1;
+        if self.above >= SHRINK_AFTER {
+            self.above = 0;
+            self.drop_oldest();
         }
     }
 
@@ -566,5 +598,36 @@ mod tests {
             }
         }
         assert_eq!(target, MIN_TARGET);
+    }
+
+    // A lower target only helps if the extra delay goes too: when the depth stayed above the
+    // target for a whole second, one frame is dropped, so latency falls without a burst of skips.
+    #[test]
+    fn drains_depth_above_the_target_slowly() {
+        let mut buffer = JitterBuffer::new();
+        for sequence in 0..12u16 {
+            buffer.push(sequence, vec![]);
+        }
+        let mut depth = buffer.stats().depth;
+        let mut ticks_since_drop = 0;
+        for sequence in 12..600u16 {
+            buffer.push(sequence, vec![]);
+            buffer.playout();
+            ticks_since_drop += 1;
+            let now = buffer.stats().depth;
+            if now < depth {
+                assert_eq!(now, depth - 1);
+                assert!(
+                    ticks_since_drop >= SHRINK_AFTER,
+                    "dropped after {ticks_since_drop} ticks"
+                );
+                ticks_since_drop = 0;
+                depth = now;
+            }
+        }
+        let stats = buffer.stats();
+        assert_eq!(stats.depth, stats.target);
+        assert_eq!(stats.discarded, 10);
+        assert_eq!(stats.concealed, 0);
     }
 }
