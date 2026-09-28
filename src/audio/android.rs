@@ -25,8 +25,10 @@
 //! The data callbacks only move samples between AAudio's buffer and the lock-free rings through
 //! the adapters: no locks, no allocation, no logging. The error callback (a device disconnected,
 //! a headset plugged in or out) only counts the error and raises a flag, since AAudio forbids
-//! closing a stream from it. The owner polls [`AaudioBackend::restart_if_needed`], which closes
-//! both streams and reopens them on the same rings.
+//! closing a stream from it. The owner calls
+//! [`AudioBackend::maintain`](super::AudioBackend::maintain) about every 100 ms; here it runs
+//! [`AaudioBackend::restart_if_needed`], which closes both streams and reopens them on the same
+//! rings.
 //!
 //! # The app's side (Kotlin) before `start`
 //!

@@ -18,7 +18,7 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 
 | Módulo   | Qué hace |
 | -------- | -------- |
-| `audio`  | Anillos SPSC sin bloqueos ni asignaciones entre los callbacks del dispositivo y el motor; adaptadores (mezcla a mono, remuestreo lineal, i16/f32, silencio y cuenta de vacíos); trait `AudioBackend`; `audio::desktop` con cpal (feature `desktop`, desactivada por defecto); `audio::ios` con `VoiceProcessingBackend` (solo iOS); `audio::android` con `AaudioBackend` sobre AAudio (solo Android). |
+| `audio`  | Anillos SPSC sin bloqueos ni asignaciones entre los callbacks del dispositivo y el motor; adaptadores (mezcla a mono, remuestreo lineal, i16/f32, silencio y cuenta de vacíos); trait `AudioBackend`; `audio::desktop` con cpal (feature `desktop`, desactivada por defecto); `audio::ios` con `VoiceProcessingBackend` (solo iOS); `audio::android` con `AaudioBackend` sobre AAudio (solo Android); `platform_backend()` y `AudioBackend::maintain`. |
 | `codec`  | Opus con libopus 1.6.1 vendorizada en `vendor/opus` y compilada con `cc` (`build.rs`, sin cmake). VoIP, 32 kbit/s, FEC en banda, 10 % de pérdida esperada, DTX apagado. `decode`, `conceal` (PLC), `recover` (FEC del paquete siguiente). |
 | `rtp`    | Opus sobre pistas de webrtc-rs 0.21 (API sans-IO + crate `rtc`): `media_engine`, `peer_connection_builder`, `add_audio_track` → `AudioSender`, `AudioReceiver`. El payload type negociado se lee en cada envío. |
 | `jitter` | `JitterBuffer`: reordena por secuencia (con el salto de 65535 a 0), profundidad adaptativa de 1 a 10 tramas según el jitter RFC 3550 medido con `push_at`; `playout()` → `Frame` / `Missing` / `Waiting`; `peek_next` para la FEC. |
@@ -107,8 +107,9 @@ Micrófono en el bus 1 (entrada habilitada), altavoz/auricular en el bus 0. Cont
   anillos a través de los adaptadores (sin bloqueos ni asignaciones). El callback de error
   (dispositivo desconectado, auriculares que se enchufan o desenchufan) solo cuenta y levanta una
   bandera: AAudio prohíbe cerrar el flujo desde él. **Quien tenga el backend llama a
-  `restart_if_needed()` cada ~100 ms**: cierra los dos flujos y los reabre sobre los mismos
-  anillos; si falla, se queda con los anillos y lo reintenta en la siguiente llamada.
+  `AudioBackend::maintain()` cada ~100 ms**, que aquí es `restart_if_needed()`: cierra los dos
+  flujos y los reabre sobre los mismos anillos; si falla, se queda con los anillos y lo
+  reintenta en la siguiente llamada.
 - **Parada**: `stop` y `Drop` paran y cierran los dos flujos antes de soltar los adaptadores y
   los anillos (el `Drop` de cada flujo cierra primero y libera su estado después).
 - **Contrato con Kotlin** (la app): antes de que Rust llame a `start`, Kotlin **tiene el permiso
@@ -179,9 +180,10 @@ adb shell rm /data/local/tmp/wee-tests
 
 Las pruebas de `build.rs` no las ejecuta Cargo; el comando está en el propio `build.rs`.
 
-CI (`.github/workflows/ci.yml`): en macOS fmt, clippy con y sin `desktop`, tests y build de iOS;
-en Ubuntu, build de Android con el NDK del runner (sin `desktop`, que pediría las cabeceras de
-ALSA). Sin secretos.
+CI (`.github/workflows/ci.yml`): en macOS fmt, clippy con y sin `desktop`, tests, y clippy y
+build de iOS; en Ubuntu, build y clippy de Android con el NDK del runner (sin `desktop`, que
+pediría las cabeceras de ALSA). El código solo de iOS o de Android solo lo revisa el clippy de su
+target. Sin secretos.
 
 ## Reglas
 
@@ -206,9 +208,9 @@ ALSA). Sin secretos.
 
 - **Backend iOS en la app**: el lado Swift (sesión de audio, CallKit, reinicio tras una
   interrupción con anillos nuevos) y probarlo en el iPhone con la pantalla bloqueada.
-- **Android, integración**: llamar a `restart_if_needed()` periódicamente desde quien tenga el
-  backend; probar una desconexión real (enchufar cascos o Bluetooth en plena llamada), Android
-  8.x (sin preset) y más teléfonos; comprobar el AEC en una llamada real.
+- **Android, integración**: llamar a `maintain()` cada ~100 ms desde quien tenga el backend
+  (en la app, junto a la `Call`); probar una desconexión real (enchufar cascos o Bluetooth en
+  plena llamada), Android 8.x (sin preset) y más teléfonos; comprobar el AEC en una llamada real.
 - **Integración en la app de FlickerTalk** (`app/`): sustituir el audio del WebView en las
   llamadas; señalización y ciclo de vida de la llamada.
 - **DTX y marcas de tiempo RTP en el jitter buffer**: hoy supone 20 ms por secuencia; con DTX los
@@ -222,11 +224,27 @@ ALSA). Sin secretos.
 
 ## Estado (2026-09-28)
 
+**Backends de los teléfonos** (rama `backends`, desde `audio-engine`): fusionadas
+`ios-backend` y `android-backend` (conflictos solo en `README.md` y `CLAUDE.md`, resueltos
+conservando los dos lados; `ci.yml`, `Cargo.toml`, `Cargo.lock` y `src/audio.rs` sin conflicto).
+Encima:
+
+- **`AudioBackend::maintain()`**, método por defecto que no hace nada: se llama cada ~100 ms
+  mientras el backend funciona, desde el hilo que lo tiene y nunca desde un callback. Android lo
+  implementa con `restart_if_needed()`, así el deber de reabrir los flujos tras una desconexión
+  está en el trait y no se olvida; iOS y el escritorio usan el de por defecto.
+- **`audio::platform_backend() -> Result<Box<dyn AudioBackend + Send>, AudioError>`**: el
+  backend de la plataforma, parado (`ios::VoiceProcessingBackend::new()`,
+  `android::AaudioBackend::new()`, `desktop::DesktopBackend::new()` con la feature `desktop`, o
+  `AudioError::NoDevice`). Los nombres de cada backend no cambian: la app programa contra ellos.
+- Tests: el `maintain` por defecto y su paso por un `Box<dyn AudioBackend + Send>` con backends
+  falsos, `platform_backend` en el host con y sin `desktop`, en el simulador de iOS (pasa) y en
+  Android (solo compilado; sin ejecutar en un dispositivo).
+
 **Backend iOS** (rama `ios-backend`): `audio::ios::VoiceProcessingBackend` sobre
 `VoiceProcessingIO`, con FFI a mano. 23 tests en el host; en el simulador de iOS pasan todos los
 tests del crate y los dos `#[ignore]` de la unidad real (arranca, captura ~50 tramas por segundo,
 vacía la cola del altavoz, para y vuelve a arrancar). Sin probar aún en un iPhone.
-
 
 Fusionadas en `engine` las cuatro ramas revisadas (`jitter`, `codec`, `rtp`, `audio`), con las
 constantes unificadas en la raíz del crate y `Cargo.lock` versionado. Hecho encima:
