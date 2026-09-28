@@ -2,14 +2,17 @@
 //! duplication, all deterministic for a given seed.
 //!
 //! [`NetworkSimulator`] is sans-IO: the caller says what time it is, as an offset on any
-//! monotonic clock. [`simulated_link`] runs it as a call's transport on Tokio's clock.
+//! monotonic clock. [`simulated_link`] runs it as a call's audio transport on Tokio's clock,
+//! and [`simulated_video_link`] as one direction of its video, keyframe requests included.
 
 mod link;
+mod video;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub use link::{LinkReceiver, LinkSender, simulated_link};
+pub use video::{VideoLinkFeedback, VideoLinkReceiver, VideoLinkSender, simulated_video_link};
 
 /// How the simulated network treats every packet.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
