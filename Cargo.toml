@@ -13,6 +13,9 @@ cpal = { version = "0.18", optional = true }
 openh264 = { version = "0.9.8", optional = true }
 # Only for the encoder options the safe wrapper does not expose (the bitrate while running).
 openh264-sys2 = { version = "0.9.8", optional = true }
+# Desktop camera (AVFoundation on macOS) and window, for trying video on a computer.
+nokhwa = { version = "0.10.11", optional = true, default-features = false, features = ["input-avfoundation"] }
+minifb = { version = "0.28", optional = true }
 rand = "0.10"
 rtc = "0.21"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
@@ -27,7 +30,7 @@ cc = "1.5.1"
 
 [features]
 # The desktop backend (cpal), for trying the engine on a computer. Mobile builds leave it out.
-desktop = ["dep:cpal", "openh264"]
+desktop = ["dep:cpal", "openh264", "dep:nokhwa", "dep:minifb"]
 # Software H.264 (Constrained Baseline) encoder and decoder, for tests and the desktop.
 openh264 = ["dep:openh264", "dep:openh264-sys2"]
 
