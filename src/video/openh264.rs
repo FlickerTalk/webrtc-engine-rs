@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use ::openh264::decoder::{Decoder, DecoderConfig};
 use ::openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile,
     RateControlMode, UsageType,
@@ -278,6 +279,73 @@ impl SoftwareEncoder {
     }
 }
 
+/// An H.264 decoder: one Annex-B access unit in, the picture out.
+pub struct SoftwareDecoder {
+    decoder: Decoder,
+    keyframe_needed: bool,
+}
+
+impl SoftwareDecoder {
+    pub fn new() -> Result<Self, VideoError> {
+        let decoder = Decoder::with_api_config(OpenH264API::from_source(), DecoderConfig::new())
+            .map_err(backend)?;
+        Ok(Self {
+            decoder,
+            keyframe_needed: true,
+        })
+    }
+
+    /// Whether the decoder is waiting for a keyframe: at the start, and after an access unit
+    /// failed to decode. The receiver should then ask the sender for one (a PLI).
+    pub fn needs_keyframe(&self) -> bool {
+        self.keyframe_needed
+    }
+
+    /// Decodes one access unit. `None` when it gave no picture (only parameter sets, say).
+    ///
+    /// While a keyframe is owed, delta frames are dropped (`None`): they reference pictures the
+    /// decoder does not have, and would only fail or show garbage.
+    pub fn decode(&mut self, data: &[u8]) -> Result<Option<I420Frame>, VideoError> {
+        let keyframe = nal_types(data).contains(&NAL_IDR);
+        if self.keyframe_needed && !keyframe {
+            return Ok(None);
+        }
+        let picture = match self.decoder.decode(data) {
+            Ok(picture) => picture,
+            Err(error) => {
+                self.keyframe_needed = true;
+                return Err(backend(error));
+            }
+        };
+        if keyframe {
+            self.keyframe_needed = false;
+        }
+        match picture {
+            Some(picture) => copy_picture(&picture).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Copies a decoded picture out of the decoder's padded buffers.
+fn copy_picture(picture: &impl YUVSource) -> Result<I420Frame, VideoError> {
+    let (width, height) = picture.dimensions();
+    let (y_stride, u_stride, v_stride) = picture.strides();
+    let rows = |plane: &[u8], stride: usize, width: usize, height: usize| -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(width * height);
+        for row in 0..height {
+            out.extend_from_slice(plane.get(row * stride..row * stride + width)?);
+        }
+        Some(out)
+    };
+    let corrupt = || VideoError::Backend("openh264: short picture buffer".to_owned());
+    let y = rows(picture.y(), y_stride, width, height).ok_or_else(corrupt)?;
+    let u = rows(picture.u(), u_stride, width / 2, height / 2).ok_or_else(corrupt)?;
+    let v = rows(picture.v(), v_stride, width / 2, height / 2).ok_or_else(corrupt)?;
+    let size = |value: usize| u32::try_from(value).map_err(|_| VideoError::Unsupported);
+    I420Frame::from_planes(size(width)?, size(height)?, y, u, v)
+}
+
 impl YUVSource for I420Frame {
     fn dimensions(&self) -> (usize, usize) {
         (self.width as usize, self.height as usize)
@@ -329,9 +397,28 @@ fn backend(error: ::openh264::Error) -> VideoError {
     VideoError::Backend(format!("openh264: {error}"))
 }
 
+/// The NAL unit types in an Annex-B access unit, in order.
+fn nal_types(data: &[u8]) -> Vec<u8> {
+    let mut types = Vec::new();
+    let mut zeros = 0;
+    for (at, &byte) in data.iter().enumerate() {
+        if byte == 1
+            && zeros >= 2
+            && let Some(header) = data.get(at + 1)
+        {
+            types.push(header & 0x1f);
+        }
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    types
+}
+
+/// The NAL unit type of an IDR slice.
+const NAL_IDR: u8 = 5;
+
 /// Bytes in the luma plane and in each chroma plane, for even, non-zero sizes.
 fn plane_sizes(width: u32, height: u32) -> Result<(usize, usize), VideoError> {
-    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(VideoError::Unsupported);
     }
     let (width, height) = (width as usize, height as usize);
@@ -346,21 +433,6 @@ fn clamp_u8(value: i32) -> u8 {
 mod tests {
     use super::*;
 
-    /// The NAL unit types in an Annex-B access unit, in order.
-    fn nal_types(data: &[u8]) -> Vec<u8> {
-        let mut types = Vec::new();
-        let mut zeros = 0;
-        for (at, &byte) in data.iter().enumerate() {
-            if byte == 1 && zeros >= 2 {
-                if let Some(header) = data.get(at + 1) {
-                    types.push(header & 0x1f);
-                }
-            }
-            zeros = if byte == 0 { zeros + 1 } else { 0 };
-        }
-        types
-    }
-
     /// A textured picture with a bright square moving across it, so that consecutive frames
     /// differ as camera frames do.
     fn moving_pattern(width: u32, height: u32, index: u32) -> I420Frame {
@@ -368,8 +440,10 @@ mod tests {
         let square = (index * 8) % width;
         for y in 0..height {
             for x in 0..width {
-                let inside = x >= square && x < square + 48 && y >= 40 && y < 88;
-                let texture = ((x * 7 + y * 13 + index * 3) % 32) as u8;
+                let inside = (square..square + 48).contains(&x) && (40..88).contains(&y);
+                // A triangle wave: texture without the hard edges a sawtooth would draw.
+                let phase = (x * 7 + y * 13 + index * 3) % 64;
+                let texture = phase.min(63 - phase) as u8;
                 let pixel = if inside {
                     [240, 230, 40]
                 } else {
@@ -488,6 +562,88 @@ mod tests {
 
         encoder.set_bitrate(u32::MAX);
         assert_eq!(encoder.bitrate(), crate::video::MAX_BITRATE_BPS);
+    }
+
+    /// Peak signal-to-noise ratio of the luma, in dB.
+    fn psnr(original: &I420Frame, decoded: &I420Frame) -> f64 {
+        let squared: f64 = original
+            .y()
+            .iter()
+            .zip(decoded.y())
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum();
+        let mse = squared / original.y().len() as f64;
+        if mse == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+
+    #[test]
+    fn decoding_gives_back_the_picture() {
+        let config = VideoConfig::default();
+        let (width, height) = (config.width, config.height);
+        let mut encoder = SoftwareEncoder::new(config).unwrap();
+        let mut decoder = SoftwareDecoder::new().unwrap();
+        let mut lowest = f64::INFINITY;
+        for index in 0..30 {
+            let original = moving_pattern(width, height, index);
+            let encoded = encoder.encode(&original, at(index)).unwrap().unwrap();
+            let decoded = decoder.decode(&encoded.data).unwrap().unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (width, height));
+            lowest = lowest.min(psnr(&original, &decoded));
+        }
+        eprintln!("lowest luma PSNR over 30 VGA frames at 800 kbit/s: {lowest:.1} dB");
+        assert!(lowest > 30.0, "PSNR {lowest:.1} dB");
+    }
+
+    #[test]
+    fn a_lost_delta_frame_spoils_the_picture_until_the_next_keyframe() {
+        let mut encoder = encoder();
+        let mut decoder = SoftwareDecoder::new().unwrap();
+        assert!(decoder.needs_keyframe(), "nothing to decode against yet");
+        let mut frames = Vec::new();
+        for index in 0..24 {
+            if index == 16 {
+                encoder.force_keyframe();
+            }
+            let original = moving_pattern(320, 240, index);
+            let encoded = encoder.encode(&original, at(index)).unwrap().unwrap();
+            frames.push((original, encoded));
+        }
+
+        for (original, encoded) in &frames[..10] {
+            let decoded = decoder.decode(&encoded.data).unwrap().unwrap();
+            assert!(psnr(original, &decoded) > 30.0);
+            assert!(!decoder.needs_keyframe());
+        }
+        // Frame 10 is lost: frame 11 references a picture the decoder never had.
+        assert!(decoder.decode(&frames[11].1.data).is_err());
+        assert!(decoder.needs_keyframe());
+        // Until a keyframe comes, delta frames give no picture rather than a broken one.
+        for (_, encoded) in &frames[12..16] {
+            assert_eq!(decoder.decode(&encoded.data), Ok(None));
+            assert!(decoder.needs_keyframe());
+        }
+        for (original, encoded) in &frames[16..] {
+            let decoded = decoder.decode(&encoded.data).unwrap().unwrap();
+            let quality = psnr(original, &decoded);
+            assert!(quality > 30.0, "PSNR {quality:.1} dB after the keyframe");
+            assert!(!decoder.needs_keyframe());
+        }
+    }
+
+    #[test]
+    fn delta_frames_before_the_first_keyframe_are_dropped() {
+        let mut encoder = encoder();
+        let mut decoder = SoftwareDecoder::new().unwrap();
+        encoder.encode(&moving_pattern(320, 240, 0), at(0)).unwrap();
+        let delta = encoder
+            .encode(&moving_pattern(320, 240, 1), at(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoder.decode(&delta.data), Ok(None));
+        assert!(decoder.needs_keyframe());
     }
 
     fn flat_rgb(width: u32, height: u32, colour: [u8; 3]) -> Vec<u8> {
