@@ -16,14 +16,19 @@ Audio only, working end to end on the desktop and in tests:
   (PLC) otherwise;
 - the desktop backend (cpal) is for trying it on a computer.
 
-Not there yet: the iOS backend (VoiceProcessingIO with the CallKit audio session), the Android
-backend (AAudio, `VOICE_COMMUNICATION`) and the integration into the FlickerTalk app.
+- `audio::ios::VoiceProcessingBackend` runs Apple's VoiceProcessingIO unit (echo cancellation,
+  noise suppression, gain control). The app owns the audio session: with CallKit, it starts the
+  backend from `provider(_:didActivate:)`; see the module documentation. It runs in the iOS
+  simulator; not tried on a phone yet.
+
+Not there yet: the Android backend (AAudio, `VOICE_COMMUNICATION`) and the integration into the
+FlickerTalk app.
 
 ## Modules
 
 | Module   | What it does |
 | -------- | ------------ |
-| `audio`  | Lock-free rings between the device callbacks and the engine; adapters that mix, resample and convert; the `AudioBackend` trait; `audio::desktop` (cpal, feature `desktop`). |
+| `audio`  | Lock-free rings between the device callbacks and the engine; adapters that mix, resample and convert; the `AudioBackend` trait; `audio::desktop` (cpal, feature `desktop`); `audio::ios` (VoiceProcessingIO, iOS only). |
 | `codec`  | Opus encoder and decoder (vendored libopus 1.6.1): 20 ms mono frames at 48 kHz, 32 kbit/s, in-band FEC, concealment and FEC recovery. |
 | `rtp`    | Opus on webrtc-rs tracks: media engine, peer connection builder, `AudioSender`, `AudioReceiver`. |
 | `jitter` | Reorders packets and hands out one frame per 20 ms; adaptive depth from 1 to 10 frames. |

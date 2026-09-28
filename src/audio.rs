@@ -14,6 +14,9 @@ pub mod adapter;
 pub mod desktop;
 pub mod format;
 pub mod frames;
+// The format and buffer handling is plain Rust, so the host tests build it too.
+#[cfg(any(target_os = "ios", test))]
+pub mod ios;
 pub mod resample;
 pub mod ring;
 
