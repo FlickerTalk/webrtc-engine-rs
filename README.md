@@ -14,16 +14,27 @@ Audio only, working end to end on the desktop and in tests:
 - microphone → Opus → RTP → loopback webrtc-rs call → jitter buffer → Opus → speaker;
 - packet loss is rebuilt from Opus in-band FEC when the next packet is there, and concealed
   (PLC) otherwise;
-- the desktop backend (cpal) is for trying it on a computer.
+- the desktop backend (cpal) is for trying it on a computer;
+- the Android backend (AAudio, `VOICE_COMMUNICATION`, with the platform's echo canceller) is
+  tested on a device; the app's Kotlin side must hold `RECORD_AUDIO` and set
+  `MODE_IN_COMMUNICATION` before starting it (see `src/audio/android.rs`);
+- `audio::ios::VoiceProcessingBackend` runs Apple's VoiceProcessingIO unit (echo cancellation,
+  noise suppression, gain control). The app owns the audio session: with CallKit, it starts the
+  backend from `provider(_:didActivate:)`; see the module documentation. It runs in the iOS
+  simulator; not tried on a phone yet.
 
-Not there yet: the iOS backend (VoiceProcessingIO with the CallKit audio session), the Android
-backend (AAudio, `VOICE_COMMUNICATION`) and the integration into the FlickerTalk app.
+`audio::platform_backend()` returns the backend for the target (iOS, Android, or the desktop
+with the `desktop` feature). While it runs, its owner calls `AudioBackend::maintain()` about
+every 100 ms: on Android that reopens the streams after a headset is plugged in or out, and
+without it the call goes silent.
+
+Not there yet: the integration into the FlickerTalk app.
 
 ## Modules
 
 | Module   | What it does |
 | -------- | ------------ |
-| `audio`  | Lock-free rings between the device callbacks and the engine; adapters that mix, resample and convert; the `AudioBackend` trait; `audio::desktop` (cpal, feature `desktop`). |
+| `audio`  | Lock-free rings between the device callbacks and the engine; adapters that mix, resample and convert; the `AudioBackend` trait; `audio::desktop` (cpal, feature `desktop`); `audio::ios` (VoiceProcessingIO, iOS only); `audio::android` (AAudio, Android only). |
 | `codec`  | Opus encoder and decoder (vendored libopus 1.6.1): 20 ms mono frames at 48 kHz, 32 kbit/s, in-band FEC, concealment and FEC recovery. |
 | `rtp`    | Opus on webrtc-rs tracks: media engine, peer connection builder, `AudioSender`, `AudioReceiver`. |
 | `jitter` | Reorders packets and hands out one frame per 20 ms; adaptive depth from 1 to 10 frames. |
@@ -82,7 +93,9 @@ CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android24-clang
 cargo build --target aarch64-linux-android
 ```
 
-Leave the `desktop` feature off for phones.
+Leave the `desktop` feature off for phones. The Android device tests are `#[ignore]`: build them
+with `cargo test --target aarch64-linux-android --lib --no-run`, push the test binary to
+`/data/local/tmp` and run it there with `--ignored audio::android`.
 
 ## Licence
 
