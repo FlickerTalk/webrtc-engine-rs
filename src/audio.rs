@@ -10,6 +10,8 @@
 //! A platform backend owns the callbacks and the adapters; the engine owns the frame ends.
 
 pub mod adapter;
+#[cfg(feature = "desktop")]
+pub mod desktop;
 pub mod format;
 pub mod frames;
 pub mod resample;

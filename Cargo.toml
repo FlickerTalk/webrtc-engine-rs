@@ -6,5 +6,9 @@ license = "AGPL-3.0-only"
 description = "Media engine for WebRTC calls on top of webrtc-rs: platform voice processing, Opus and a jitter buffer"
 repository = "https://github.com/FlickerTalk/webrtc-engine-rs"
 
-
 [dependencies]
+cpal = { version = "0.18", optional = true }
+
+[features]
+# The desktop backend (cpal), for trying the engine on a computer. Mobile builds leave it out.
+desktop = ["dep:cpal"]

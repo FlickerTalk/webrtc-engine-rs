@@ -18,7 +18,7 @@ impl Counter {
         self.0.load(Ordering::Relaxed)
     }
 
-    fn add(&self, amount: u64) {
+    pub(crate) fn add(&self, amount: u64) {
         self.0.fetch_add(amount, Ordering::Relaxed);
     }
 }
