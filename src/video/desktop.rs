@@ -572,6 +572,11 @@ impl WindowSink {
         }
     }
 
+    /// Where the sink puts its pictures, for a [`VideoWindow`] to show.
+    pub fn slot(&self) -> FrameSlot {
+        self.slot.clone()
+    }
+
     pub fn monitor(&self) -> SinkMonitor {
         SinkMonitor {
             counters: self.counters.clone(),
@@ -955,6 +960,17 @@ mod tests {
 
         sink.stop().unwrap();
         assert_eq!(slot.latest(), None, "stopping clears the window");
+    }
+
+    #[test]
+    fn the_sink_shows_its_pictures_in_the_slot_it_hands_out() {
+        let mut sink = WindowSink::new(FrameSlot::new());
+        let slot = sink.slot();
+        sink.start().unwrap();
+        for frame in encoded(2, &[]) {
+            sink.push(frame).unwrap();
+        }
+        assert!(slot.latest().is_some());
     }
 
     #[test]
