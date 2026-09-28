@@ -2,14 +2,22 @@
 //! `nokhwa` (AVFoundation) encoded with [`SoftwareEncoder`](super::openh264::SoftwareEncoder),
 //! and a window through `minifb` fed by [`SoftwareDecoder`](super::openh264::SoftwareDecoder).
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use nokhwa::pixel_format::YuyvFormat;
+use nokhwa::utils::{
+    ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
+    Resolution,
+};
+use nokhwa::{Camera, NokhwaError};
 
 use super::openh264::{I420Frame, SoftwareDecoder, SoftwareEncoder};
 use super::{
-    EncodedFrame, FrameSender, Rotation, SendOutcome, VideoConfig, VideoError, VideoSink,
-    clamp_bitrate,
+    EncodedFrame, Facing, FrameSender, Rotation, SendOutcome, VideoConfig, VideoError, VideoSink,
+    VideoSource, clamp_bitrate,
 };
 
 /// What the engine asks of a running camera, read by its capture thread before each frame.
@@ -17,13 +25,27 @@ use super::{
 struct Controls {
     keyframe: AtomicBool,
     bitrate_bps: AtomicU32,
+    stop: AtomicBool,
+    /// The camera to move to, or [`NO_SWITCH`].
+    switch_to: AtomicUsize,
 }
+
+const NO_SWITCH: usize = usize::MAX;
 
 impl Controls {
     fn new(bitrate_bps: u32) -> Self {
         Self {
             keyframe: AtomicBool::new(false),
             bitrate_bps: AtomicU32::new(clamp_bitrate(bitrate_bps)),
+            stop: AtomicBool::new(false),
+            switch_to: AtomicUsize::new(NO_SWITCH),
+        }
+    }
+
+    fn take_switch(&self) -> Option<usize> {
+        match self.switch_to.swap(NO_SWITCH, Ordering::Relaxed) {
+            NO_SWITCH => None,
+            next => Some(next),
         }
     }
 
@@ -86,6 +108,224 @@ impl CapturePipeline {
 /// The camera after `current` among `count`, wrapping around; `None` with fewer than two.
 fn next_camera(current: usize, count: usize) -> Option<usize> {
     (count >= 2).then(|| (current + 1) % count)
+}
+
+/// The Mac's camera as a [`VideoSource`]: nokhwa (AVFoundation) captures YUYV, which is
+/// repacked into I420, encoded with OpenH264 and sent, all on a thread of its own.
+///
+/// Desktop cameras do not face a way: [`Facing`] is ignored, and
+/// [`VideoSource::switch_camera`] moves to the next camera, if there is one. The first time, macOS
+/// asks the user for the camera permission (for the terminal, when run from one).
+pub struct CameraSource {
+    preview: FrameSlot,
+    /// Which camera, as a position in the list AVFoundation gives.
+    camera: usize,
+    running: Option<Running>,
+}
+
+struct Running {
+    controls: Arc<Controls>,
+    thread: JoinHandle<Result<(), VideoError>>,
+}
+
+/// How long `start` waits for the camera to open, and for the user to answer the permission
+/// prompt.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+
+impl CameraSource {
+    pub fn new() -> Self {
+        Self {
+            preview: FrameSlot::new(),
+            camera: 0,
+            running: None,
+        }
+    }
+
+    /// The local preview: each captured picture, as the sensor gives it (not mirrored).
+    pub fn preview(&self) -> FrameSlot {
+        self.preview.clone()
+    }
+}
+
+impl Default for CameraSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CameraSource {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+impl VideoSource for CameraSource {
+    fn start(
+        &mut self,
+        config: VideoConfig,
+        _facing: Facing,
+        out: FrameSender,
+    ) -> Result<(), VideoError> {
+        self.stop()?;
+        ensure_permission()?;
+        let cameras = cameras()?;
+        let index = cameras
+            .get(self.camera)
+            .or(cameras.first())
+            .cloned()
+            .ok_or(VideoError::NoCamera)?;
+        let controls = Arc::new(Controls::new(config.bitrate_bps));
+        let pipeline = CapturePipeline::new(config, out, controls.clone(), self.preview.clone())?;
+        let (opened, open_result) = mpsc::channel();
+        let thread_controls = controls.clone();
+        let thread = thread::Builder::new()
+            .name("camera".to_owned())
+            .spawn(move || capture(index, config, pipeline, &thread_controls, opened))
+            .map_err(|error| VideoError::Backend(format!("camera thread: {error}")))?;
+        let running = Running { controls, thread };
+        match open_result.recv_timeout(OPEN_TIMEOUT) {
+            Ok(Ok(())) => {
+                self.running = Some(running);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let _ = running.thread.join();
+                Err(error)
+            }
+            Err(_) => {
+                // Still opening: tell the thread to give up once it can; don't wait for it.
+                running.controls.stop.store(true, Ordering::Relaxed);
+                Err(VideoError::Backend("the camera did not open".to_owned()))
+            }
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), VideoError> {
+        let Some(running) = self.running.take() else {
+            return Ok(());
+        };
+        running.controls.stop.store(true, Ordering::Relaxed);
+        self.preview.clear();
+        running
+            .thread
+            .join()
+            .map_err(|_| VideoError::Backend("the camera thread panicked".to_owned()))?
+    }
+
+    fn request_keyframe(&mut self) {
+        if let Some(running) = &self.running {
+            running.controls.request_keyframe();
+        }
+    }
+
+    fn set_bitrate(&mut self, bps: u32) {
+        if let Some(running) = &self.running {
+            running.controls.set_bitrate(bps);
+        }
+    }
+
+    fn switch_camera(&mut self, _facing: Facing) -> Result<(), VideoError> {
+        let next = next_camera(self.camera, cameras()?.len()).ok_or(VideoError::Unsupported)?;
+        self.camera = next;
+        if let Some(running) = &self.running {
+            running.controls.switch_to.store(next, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+/// Asks for the camera permission if the user has not given it yet, and waits for the answer.
+fn ensure_permission() -> Result<(), VideoError> {
+    if nokhwa::nokhwa_check() {
+        return Ok(());
+    }
+    let (answer, answered) = mpsc::channel();
+    nokhwa::nokhwa_initialize(move |granted| {
+        let _ = answer.send(granted);
+    });
+    match answered.recv_timeout(OPEN_TIMEOUT) {
+        Ok(true) => Ok(()),
+        _ => Err(VideoError::PermissionDenied),
+    }
+}
+
+/// The cameras AVFoundation sees, in its order.
+fn cameras() -> Result<Vec<CameraIndex>, VideoError> {
+    let cameras = nokhwa::query(ApiBackend::AVFoundation).map_err(camera_error)?;
+    Ok(cameras.iter().map(|info| info.index().clone()).collect())
+}
+
+fn open_camera(index: CameraIndex, config: VideoConfig) -> Result<Camera, VideoError> {
+    let wanted = CameraFormat::new(
+        Resolution::new(config.width, config.height),
+        FrameFormat::YUYV,
+        config.fps,
+    );
+    let format = RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Closest(wanted));
+    let mut camera =
+        Camera::with_backend(index, format, ApiBackend::AVFoundation).map_err(camera_error)?;
+    camera.open_stream().map_err(camera_error)?;
+    Ok(camera)
+}
+
+/// The camera thread: opens the camera, says how that went on `opened`, then captures until
+/// told to stop or the engine is gone.
+fn capture(
+    index: CameraIndex,
+    config: VideoConfig,
+    mut pipeline: CapturePipeline,
+    controls: &Controls,
+    opened: mpsc::Sender<Result<(), VideoError>>,
+) -> Result<(), VideoError> {
+    let mut camera = match open_camera(index, config) {
+        Ok(camera) => {
+            let _ = opened.send(Ok(()));
+            camera
+        }
+        Err(error) => {
+            let _ = opened.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let clock = Instant::now();
+    let result = loop {
+        if controls.stop.load(Ordering::Relaxed) {
+            break Ok(());
+        }
+        if let Some(next) = controls.take_switch() {
+            let _ = camera.stop_stream();
+            let index = match cameras()?.get(next) {
+                Some(index) => index.clone(),
+                None => break Err(VideoError::NoCamera),
+            };
+            camera = open_camera(index, config)?;
+            // The receiver's decoder cannot go on from the other camera's pictures.
+            controls.request_keyframe();
+        }
+        let buffer = match camera.frame() {
+            Ok(buffer) => buffer,
+            Err(error) => break Err(camera_error(error)),
+        };
+        let timestamp = clock.elapsed();
+        let (width, height) = (buffer.resolution().width(), buffer.resolution().height());
+        let data = buffer.buffer();
+        let stride = data.len() / (height.max(1) as usize);
+        let picture = match yuyv_to_i420(width, height, stride, data) {
+            Ok(picture) => picture,
+            Err(error) => break Err(error),
+        };
+        match pipeline.process(picture, timestamp) {
+            Ok(SendOutcome::Closed) => break Ok(()),
+            Ok(SendOutcome::Sent | SendOutcome::Dropped) => {}
+            Err(error) => break Err(error),
+        }
+    };
+    let _ = camera.stop_stream();
+    result
+}
+
+fn camera_error(error: NokhwaError) -> VideoError {
+    VideoError::Backend(format!("camera: {error}"))
 }
 
 /// A decoded or captured picture and how to turn it to show it upright.
@@ -277,7 +517,7 @@ pub fn yuyv_to_i420(
     for index in (0..rows).step_by(2) {
         let (top, bottom) = (row(index), row(index + 1));
         for (a, b) in top.chunks_exact(4).zip(bottom.chunks_exact(4)) {
-            let average = |i: usize| ((u16::from(a[i]) + u16::from(b[i]) + 1) / 2) as u8;
+            let average = |i: usize| (u16::from(a[i]) + u16::from(b[i])).div_ceil(2) as u8;
             u.push(average(1));
             v.push(average(3));
         }
@@ -394,6 +634,37 @@ mod tests {
         assert_eq!(next_camera(1, 3), Some(2));
         assert_eq!(next_camera(0, 1), None);
         assert_eq!(next_camera(0, 0), None);
+    }
+
+    /// Needs a camera and the camera permission for the terminal: run it by hand.
+    #[test]
+    #[ignore = "needs a camera"]
+    fn captures_encoded_frames_from_the_camera() {
+        let (out, frames) = frame_channel(crate::video::FRAME_CHANNEL_CAPACITY);
+        let mut camera = CameraSource::new();
+        let preview = camera.preview();
+        camera
+            .start(VideoConfig::default(), Facing::Front, out)
+            .unwrap();
+        let first = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(first.keyframe);
+        let mut received = 1;
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < until {
+            if frames.recv_timeout(Duration::from_millis(200)).is_ok() {
+                received += 1;
+            }
+        }
+        camera.request_keyframe();
+        camera.set_bitrate(300_000);
+        assert!(received > 20, "{received} frames in 2 s");
+        assert!(preview.latest().is_some());
+        match camera.switch_camera(Facing::Back) {
+            Ok(()) | Err(VideoError::Unsupported) => {}
+            Err(error) => panic!("switching: {error}"),
+        }
+        camera.stop().unwrap();
+        camera.stop().unwrap();
     }
 
     #[test]
