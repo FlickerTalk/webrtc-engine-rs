@@ -130,7 +130,8 @@ impl Decoder {
         Ok(decoder)
     }
 
-    /// Decodes one packet.
+    /// Decodes one packet into as many samples as it carries: 960 for the 20 ms packets
+    /// [`Encoder`] makes, up to 120 ms for other senders.
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>, Error> {
         self.run(packet, MAX_DECODED_SAMPLES, false)
     }

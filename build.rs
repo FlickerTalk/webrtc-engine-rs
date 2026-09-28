@@ -5,6 +5,10 @@
 //! build machines, so we compile the plain C sources ourselves. The source
 //! lists come from libopus' own `*_sources.mk` files so an upgrade of the
 //! vendored tree needs no change here.
+//!
+//! Cross builds: for iOS set `IPHONEOS_DEPLOYMENT_TARGET` (Xcode does), otherwise clang
+//! stamps the objects with the SDK version as minimum OS. For Android point
+//! `CC_aarch64_linux_android` and `AR_aarch64_linux_android` at the NDK's clang and llvm-ar.
 
 use std::fs;
 use std::path::{Path, PathBuf};
