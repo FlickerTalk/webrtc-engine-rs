@@ -19,7 +19,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::assemble::{AssemblerStats, FrameAssembler};
+use super::assemble::{AssemblerStats, FrameAssembler, KEYFRAME_REQUEST_INTERVAL};
 use super::bitrate::BitrateController;
 use super::packet::VideoPacket;
 use super::{
@@ -82,6 +82,9 @@ pub trait VideoPacketSource: Send + 'static {
 /// How often a [`VideoCall`] refreshes the counters of the other side's stream while no frame
 /// comes.
 const STATS_REFRESH: Duration = Duration::from_millis(250);
+
+/// How often a lost camera ([`VideoSource::lost`]) is started again, at most.
+pub const CAMERA_RESTART_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often [`RemoteVideo`] looks at the clock while no packet comes: a gap is given up, and a
 /// keyframe requested, within this of [`super::assemble::MAX_WAIT`].
@@ -210,6 +213,13 @@ pub struct VideoStats {
     pub frames_received: u64,
     /// Frames the sink could not decode: each one asks for a keyframe.
     pub sink_errors: u64,
+    /// Keyframes asked for because the sink said so ([`VideoSink::keyframe_needed`]), after
+    /// rate limiting.
+    pub sink_keyframe_requests: u64,
+    /// The camera is lost ([`VideoSource::lost`]) and could not be started again yet.
+    pub camera_lost: bool,
+    /// Times a lost camera was started again.
+    pub camera_restarts: u64,
     /// Reassembly of the other side's frames: dropped frames, keyframe requests sent…
     pub remote: AssemblerStats,
     /// Times the transport failed to deliver; receiving stops at the first.
@@ -317,7 +327,12 @@ impl VideoCall {
             runtime.spawn(send_task(
                 incoming,
                 transport.frames,
-                shared.clone(),
+                CameraWatch {
+                    shared: shared.clone(),
+                    frames: frames.clone(),
+                    video: config.video,
+                    last_restart: None,
+                },
                 config.poll_interval,
                 stopped.clone(),
             )),
@@ -424,13 +439,60 @@ async fn stopping(stopped: &mut watch::Receiver<bool>) {
     let _ = stopped.wait_for(|stop| *stop).await;
 }
 
+/// Watches the call's camera and starts it again when it is lost.
+struct CameraWatch {
+    shared: Arc<Shared>,
+    frames: FrameSender,
+    video: VideoConfig,
+    last_restart: Option<Instant>,
+}
+
+impl CameraWatch {
+    /// Whether the camera is lost now, after trying to start it again if it is time to.
+    fn check(&mut self) -> bool {
+        // The lock order of `VideoCall::resume`: state, then source.
+        let state = lock(&self.shared.state);
+        if state.paused {
+            // The camera is off; resuming starts it anew.
+            return false;
+        }
+        let mut source = lock(&self.shared.source);
+        if !source.lost() {
+            return false;
+        }
+        if self
+            .last_restart
+            .is_some_and(|at| at.elapsed() < CAMERA_RESTART_INTERVAL)
+        {
+            return true;
+        }
+        self.last_restart = Some(Instant::now());
+        let video = VideoConfig {
+            bitrate_bps: lock(&self.shared.stats).bitrate_bps,
+            ..self.video
+        };
+        // A failed start is tried again after the interval; the stats say the camera is lost.
+        let _ = source.stop();
+        if source
+            .start(video, state.facing, self.frames.clone())
+            .is_err()
+        {
+            return true;
+        }
+        source.request_keyframe();
+        self.shared.update(|stats| stats.camera_restarts += 1);
+        source.lost()
+    }
+}
+
 async fn send_task<S: FrameSink>(
     incoming: super::FrameReceiver,
     mut out: S,
-    shared: Arc<Shared>,
+    mut camera: CameraWatch,
     poll_interval: Duration,
     mut stopped: watch::Receiver<bool>,
 ) {
+    let shared = camera.shared.clone();
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (mut sent, mut keyframes, mut errors) = (0, 0, 0);
@@ -451,11 +513,13 @@ async fn send_task<S: FrameSink>(
                     Err(_) => errors += 1,
                 }
             }
+            let lost = camera.check();
             shared.update(|stats| {
                 stats.frames_sent = sent;
                 stats.keyframes_sent = keyframes;
                 stats.send_errors = errors;
                 stats.source_dropped = incoming.dropped();
+                stats.camera_lost = lost;
             });
         }
     };
@@ -504,34 +568,43 @@ async fn receive_task<R: FrameSource>(
     shared: Arc<Shared>,
     mut stopped: watch::Receiver<bool>,
 ) {
+    // When a keyframe was last asked for; the sink's own requests wait this long.
+    let mut last_request: Option<Instant> = None;
     let work = async {
         loop {
             // Now and then even without frames, so the counters show a stream that is stuck.
             let received = tokio::time::timeout(STATS_REFRESH, remote.recv()).await;
             let assembled = remote.stats();
             shared.update(|stats| stats.remote = assembled);
-            let Ok(received) = received else {
-                continue;
-            };
-            match received {
-                Ok(Some(frame)) => {
+            let asked = match received {
+                Err(_) => Ok(()),
+                Ok(Ok(Some(frame))) => {
                     let shown = lock(&shared.sink).push(frame);
                     match shown {
-                        Ok(()) => shared.update(|stats| stats.frames_received += 1),
+                        Ok(()) => {
+                            shared.update(|stats| stats.frames_received += 1);
+                            Ok(())
+                        }
                         Err(_) => {
                             shared.update(|stats| stats.sink_errors += 1);
-                            if remote.request_keyframe().await.is_err() {
-                                shared.update(|stats| stats.receive_errors += 1);
-                                break;
-                            }
+                            last_request = Some(Instant::now());
+                            remote.request_keyframe().await
                         }
                     }
                 }
-                Ok(None) => break,
-                Err(_) => {
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) => {
                     shared.update(|stats| stats.receive_errors += 1);
                     break;
                 }
+            };
+            let asked = match asked {
+                Ok(()) => sink_keyframe_request(&mut remote, &shared, &mut last_request).await,
+                failed => failed,
+            };
+            if asked.is_err() {
+                shared.update(|stats| stats.receive_errors += 1);
+                break;
             }
         }
     };
@@ -541,12 +614,32 @@ async fn receive_task<R: FrameSource>(
     }
 }
 
+/// Asks the other side for a keyframe if the sink needs one, at most once every
+/// [`KEYFRAME_REQUEST_INTERVAL`]. The sink is not asked inside the interval, so a request it
+/// raises as an event waits there until it can be sent.
+async fn sink_keyframe_request<R: FrameSource>(
+    remote: &mut R,
+    shared: &Shared,
+    last_request: &mut Option<Instant>,
+) -> Result<(), R::Error> {
+    if last_request.is_some_and(|at| at.elapsed() < KEYFRAME_REQUEST_INTERVAL) {
+        return Ok(());
+    }
+    if !lock(&shared.sink).keyframe_needed() {
+        return Ok(());
+    }
+    *last_request = Some(Instant::now());
+    shared.update(|stats| stats.sink_keyframe_requests += 1);
+    remote.request_keyframe().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::video::assemble::MAX_WAIT;
     use crate::video::fake::{FakeSink, FakeSource, SinkProbe, SourceProbe, frame_index};
     use crate::video::packet::Packetizer;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     const CONFIG: VideoCallConfig = VideoCallConfig {
@@ -611,6 +704,11 @@ mod tests {
         Arc<Mutex<SinkProbe>>,
     ) {
         let (source_probe, sink_probe) = (source.probe(), sink.probe());
+        let (call, ends) = looped_boxed(Box::new(source), Box::new(sink));
+        (call, ends, source_probe, sink_probe)
+    }
+
+    fn looped_boxed(source: Box<dyn VideoSource>, sink: Box<dyn VideoSink>) -> (VideoCall, Ends) {
         let (out, frames) = mpsc::unbounded_channel();
         let (feedback, told) = mpsc::unbounded_channel();
         let (requests, keyframe_requests) = mpsc::unbounded_channel();
@@ -622,13 +720,13 @@ mod tests {
                 keyframe_requests: requests,
             },
         };
-        let call = VideoCall::start(Box::new(source), Box::new(sink), transport, CONFIG).unwrap();
+        let call = VideoCall::start(source, sink, transport, CONFIG).unwrap();
         let ends = Ends {
             feedback,
             keyframe_requests,
             inject: out,
         };
-        (call, ends, source_probe, sink_probe)
+        (call, ends)
     }
 
     fn shown(probe: &Arc<Mutex<SinkProbe>>) -> Vec<u32> {
@@ -765,6 +863,197 @@ mod tests {
         call.stop().await;
         assert!(ends.feedback.is_closed());
         assert!(ends.inject.is_closed());
+    }
+
+    /// A [`FakeSink`] whose decoder says it needs a keyframe while `needs` is set; with `once`,
+    /// it says it one time and clears the flag, as a sink that raises an event.
+    struct NeedySink {
+        inner: FakeSink,
+        needs: Arc<AtomicBool>,
+        once: bool,
+    }
+
+    impl NeedySink {
+        fn new(once: bool) -> (Self, Arc<AtomicBool>) {
+            let needs = Arc::new(AtomicBool::new(false));
+            let sink = Self {
+                inner: FakeSink::new(),
+                needs: needs.clone(),
+                once,
+            };
+            (sink, needs)
+        }
+    }
+
+    impl VideoSink for NeedySink {
+        fn start(&mut self) -> Result<(), VideoError> {
+            self.inner.start()
+        }
+        fn push(&mut self, frame: EncodedFrame) -> Result<(), VideoError> {
+            self.inner.push(frame)
+        }
+        fn stop(&mut self) -> Result<(), VideoError> {
+            self.inner.stop()
+        }
+        fn keyframe_needed(&mut self) -> bool {
+            if self.once {
+                self.needs.swap(false, Ordering::Relaxed)
+            } else {
+                self.needs.load(Ordering::Relaxed)
+            }
+        }
+    }
+
+    fn drain(requests: &mut mpsc::UnboundedReceiver<()>) -> usize {
+        std::iter::from_fn(|| requests.try_recv().ok()).count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sink_that_needs_a_keyframe_asks_the_other_side_at_a_limited_rate() {
+        let (sink, needs) = NeedySink::new(false);
+        let (call, mut ends) = looped_boxed(Box::new(FakeSource::new()), Box::new(sink));
+        run_for(300).await;
+        assert_eq!(drain(&mut ends.keyframe_requests), 0, "the decoder is fine");
+
+        needs.store(true, Ordering::Relaxed);
+        run_for(1_100).await;
+        let asked = drain(&mut ends.keyframe_requests);
+        // Once right away and then once per interval, not once per frame.
+        assert!((2..=3).contains(&asked), "{asked} requests");
+
+        needs.store(false, Ordering::Relaxed);
+        run_for(1_000).await;
+        assert_eq!(
+            drain(&mut ends.keyframe_requests),
+            0,
+            "the decoder is fine again"
+        );
+        let stats = call.stop().await;
+        assert_eq!(stats.sink_keyframe_requests, asked as u64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_keyframe_the_sink_asks_for_once_is_asked_for_once() {
+        let (sink, needs) = NeedySink::new(true);
+        let (call, mut ends) = looped_boxed(Box::new(FakeSource::new()), Box::new(sink));
+        run_for(300).await;
+        needs.store(true, Ordering::Relaxed);
+        run_for(1_000).await;
+        let stats = call.stop().await;
+        assert_eq!(drain(&mut ends.keyframe_requests), 1);
+        assert_eq!(stats.sink_keyframe_requests, 1);
+    }
+
+    /// A [`FakeSource`] whose camera can be lost. Starting it finds the camera again, unless it
+    /// is `broken`.
+    struct FlakySource {
+        inner: FakeSource,
+        camera: Arc<CameraState>,
+    }
+
+    #[derive(Default)]
+    struct CameraState {
+        lost: AtomicBool,
+        broken: AtomicBool,
+        starts: AtomicU64,
+    }
+
+    impl FlakySource {
+        fn new() -> (Self, Arc<CameraState>) {
+            let camera = Arc::new(CameraState::default());
+            let source = Self {
+                inner: FakeSource::new(),
+                camera: camera.clone(),
+            };
+            (source, camera)
+        }
+    }
+
+    impl VideoSource for FlakySource {
+        fn start(
+            &mut self,
+            config: VideoConfig,
+            facing: Facing,
+            out: FrameSender,
+        ) -> Result<(), VideoError> {
+            self.camera.starts.fetch_add(1, Ordering::Relaxed);
+            if self.camera.broken.load(Ordering::Relaxed) {
+                return Err(VideoError::NoCamera);
+            }
+            self.camera.lost.store(false, Ordering::Relaxed);
+            self.inner.start(config, facing, out)
+        }
+        fn stop(&mut self) -> Result<(), VideoError> {
+            self.inner.stop()
+        }
+        fn request_keyframe(&mut self) {
+            self.inner.request_keyframe();
+        }
+        fn set_bitrate(&mut self, bps: u32) {
+            self.inner.set_bitrate(bps);
+        }
+        fn switch_camera(&mut self, facing: Facing) -> Result<(), VideoError> {
+            self.inner.switch_camera(facing)
+        }
+        fn lost(&self) -> bool {
+            self.camera.lost.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_camera_is_started_again() {
+        let (source, camera) = FlakySource::new();
+        let probe = source.inner.probe();
+        let (call, _ends) = looped_boxed(Box::new(source), Box::new(FakeSink::new()));
+        run_for(300).await;
+        camera.lost.store(true, Ordering::Relaxed);
+        run_for(300).await;
+        let stats = call.stop().await;
+
+        assert_eq!(camera.starts.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.camera_restarts, 1);
+        assert!(!stats.camera_lost);
+        assert_eq!(stats.keyframes_sent, 2, "it starts again with a keyframe");
+        assert!(lock(&probe).keyframe_requests >= 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_camera_that_does_not_come_back_is_reported_and_retried_now_and_then() {
+        let (source, camera) = FlakySource::new();
+        let (call, _ends) = looped_boxed(Box::new(source), Box::new(FakeSink::new()));
+        run_for(300).await;
+        camera.broken.store(true, Ordering::Relaxed);
+        camera.lost.store(true, Ordering::Relaxed);
+        run_for(100).await;
+        assert!(call.stats().camera_lost);
+
+        run_for(2_000).await;
+        let attempts = camera.starts.load(Ordering::Relaxed) - 1;
+        assert!((2..=3).contains(&attempts), "{attempts} attempts");
+        assert_eq!(call.stats().camera_restarts, 0);
+
+        camera.broken.store(false, Ordering::Relaxed);
+        run_for(1_100).await;
+        let stats = call.stop().await;
+        assert!(!stats.camera_lost);
+        assert_eq!(stats.camera_restarts, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_call_leaves_a_lost_camera_alone() {
+        let (source, camera) = FlakySource::new();
+        let (call, _ends) = looped_boxed(Box::new(source), Box::new(FakeSink::new()));
+        run_for(100).await;
+        call.pause().unwrap();
+        camera.lost.store(true, Ordering::Relaxed);
+        run_for(1_500).await;
+        assert_eq!(camera.starts.load(Ordering::Relaxed), 1);
+        call.resume().unwrap();
+        run_for(100).await;
+        let stats = call.stop().await;
+        assert_eq!(camera.starts.load(Ordering::Relaxed), 2);
+        assert!(!stats.camera_lost);
+        assert_eq!(stats.camera_restarts, 0, "resuming is not a restart");
     }
 
     #[test]
