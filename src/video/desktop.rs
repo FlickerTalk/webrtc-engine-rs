@@ -328,6 +328,87 @@ fn camera_error(error: NokhwaError) -> VideoError {
     VideoError::Backend(format!("camera: {error}"))
 }
 
+/// Draws a window's contents into `canvas` (`width × height`, 0RGB): `remote` fitted to the
+/// window and turned upright, `preview` mirrored in the bottom-right corner, black elsewhere.
+pub fn compose(
+    canvas: &mut [u32],
+    width: usize,
+    height: usize,
+    remote: Option<&Picture>,
+    preview: Option<&Picture>,
+) {
+    canvas.fill(0);
+    if canvas.len() < width * height {
+        return;
+    }
+    if let Some(remote) = remote {
+        draw_fitted(canvas, width, (0, 0, width, height), remote, false);
+    }
+    if let Some(preview) = preview {
+        let (box_width, box_height) = (width / 4, height / 4);
+        let margin = width / 40;
+        let area = (
+            width.saturating_sub(box_width + margin),
+            height.saturating_sub(box_height + margin),
+            box_width,
+            box_height,
+        );
+        draw_fitted(canvas, width, area, preview, true);
+    }
+}
+
+/// Draws `picture` upright (and `mirrored`, if asked) as large as it fits in `area`
+/// (`x, y, width, height`), centred, with nearest-neighbour scaling.
+fn draw_fitted(
+    canvas: &mut [u32],
+    stride: usize,
+    area: (usize, usize, usize, usize),
+    picture: &Picture,
+    mirrored: bool,
+) {
+    let (area_x, area_y, area_width, area_height) = area;
+    let frame = &picture.frame;
+    let (source_width, source_height) = (frame.width() as usize, frame.height() as usize);
+    let sideways = matches!(picture.rotation, Rotation::Deg90 | Rotation::Deg270);
+    // The picture's size once upright.
+    let (upright_width, upright_height) = if sideways {
+        (source_height, source_width)
+    } else {
+        (source_width, source_height)
+    };
+    if upright_width == 0 || upright_height == 0 {
+        return;
+    }
+    let (width, height) = if upright_width * area_height <= area_width * upright_height {
+        (upright_width * area_height / upright_height, area_height)
+    } else {
+        (area_width, upright_height * area_width / upright_width)
+    };
+    let (left, top) = (
+        area_x + (area_width - width) / 2,
+        area_y + (area_height - height) / 2,
+    );
+    for row in 0..height {
+        let v = row * upright_height / height;
+        for column in 0..width {
+            let mut u = column * upright_width / width;
+            if mirrored {
+                u = upright_width - 1 - u;
+            }
+            let (x, y) = match picture.rotation {
+                Rotation::Deg0 => (u, v),
+                Rotation::Deg90 => (v, source_height - 1 - u),
+                Rotation::Deg180 => (source_width - 1 - u, source_height - 1 - v),
+                Rotation::Deg270 => (source_width - 1 - v, u),
+            };
+            let [r, g, b] = frame.rgb_at(x as u32, y as u32).unwrap_or_default();
+            if let Some(pixel) = canvas.get_mut((top + row) * stride + left + column) {
+                *pixel = u32::from_be_bytes([0, r, g, b]);
+            }
+        }
+    }
+}
+
 /// A decoded or captured picture and how to turn it to show it upright.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picture {
@@ -665,6 +746,102 @@ mod tests {
         }
         camera.stop().unwrap();
         camera.stop().unwrap();
+    }
+
+    const RED: u32 = 0xff_00_00;
+    const BLUE: u32 = 0x00_00_ff;
+
+    /// A picture with its left half red and its right half blue.
+    fn halves(width: u32, height: u32, rotation: Rotation) -> Picture {
+        let mut rgb = Vec::new();
+        for _ in 0..height {
+            for x in 0..width {
+                let colour = if x < width / 2 { RED } else { BLUE };
+                rgb.extend_from_slice(&colour.to_be_bytes()[1..]);
+            }
+        }
+        Picture {
+            frame: Arc::new(I420Frame::from_rgb(width, height, &rgb).unwrap()),
+            rotation,
+        }
+    }
+
+    /// The canvas as rows of 'R', 'B', '.' (black) and '?' (anything else).
+    fn draw(
+        width: usize,
+        height: usize,
+        remote: Option<&Picture>,
+        preview: Option<&Picture>,
+    ) -> Vec<String> {
+        let mut canvas = vec![0x12_34_56; width * height];
+        compose(&mut canvas, width, height, remote, preview);
+        let near = |pixel: u32, colour: u32| {
+            pixel
+                .to_be_bytes()
+                .iter()
+                .zip(colour.to_be_bytes())
+                .all(|(a, b)| a.abs_diff(b) <= 8)
+        };
+        canvas
+            .chunks(width)
+            .map(|row| {
+                row.iter()
+                    .map(|&pixel| match pixel {
+                        pixel if near(pixel, RED) => 'R',
+                        pixel if near(pixel, BLUE) => 'B',
+                        0 => '.',
+                        _ => '?',
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_window_is_black() {
+        assert_eq!(draw(4, 2, None, None), ["....", "...."]);
+    }
+
+    #[test]
+    fn the_remote_picture_is_scaled_to_fit_and_keeps_its_shape() {
+        let picture = halves(4, 2, Rotation::Deg0);
+        assert_eq!(draw(8, 4, Some(&picture), None), ["RRRRBBBB"; 4]);
+        assert_eq!(
+            draw(8, 8, Some(&picture), None),
+            [
+                "........", "........", "RRRRBBBB", "RRRRBBBB", "RRRRBBBB", "RRRRBBBB", "........",
+                "........"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_remote_picture_is_turned_upright() {
+        // Turned clockwise, the left half ends up on top.
+        assert_eq!(
+            draw(2, 4, Some(&halves(4, 2, Rotation::Deg90)), None),
+            ["RR", "RR", "BB", "BB"]
+        );
+        assert_eq!(
+            draw(4, 2, Some(&halves(4, 2, Rotation::Deg180)), None),
+            ["BBRR", "BBRR"]
+        );
+        assert_eq!(
+            draw(2, 4, Some(&halves(4, 2, Rotation::Deg270)), None),
+            ["BB", "BB", "RR", "RR"]
+        );
+    }
+
+    #[test]
+    fn the_preview_is_mirrored_in_the_bottom_right_corner() {
+        let preview = halves(4, 4, Rotation::Deg0);
+        let rows = draw(16, 16, None, Some(&preview));
+        for row in &rows[..12] {
+            assert_eq!(row, "................");
+        }
+        for row in &rows[12..] {
+            assert_eq!(row, "............BBRR", "mirrored, as in a mirror");
+        }
     }
 
     #[test]
