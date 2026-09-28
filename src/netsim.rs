@@ -1,10 +1,15 @@
 //! A simulated network for tests and demos: delay, random jitter, loss, reordering and
 //! duplication, all deterministic for a given seed.
 //!
-//! It is sans-IO: the caller says what time it is. Times are offsets on any monotonic clock.
+//! [`NetworkSimulator`] is sans-IO: the caller says what time it is, as an offset on any
+//! monotonic clock. [`simulated_link`] runs it as a call's transport on Tokio's clock.
+
+mod link;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+pub use link::{LinkReceiver, LinkSender, simulated_link};
 
 /// How the simulated network treats every packet.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
