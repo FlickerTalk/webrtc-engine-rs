@@ -55,6 +55,11 @@ impl PlayoutFrames {
     pub fn frames_free(&self) -> usize {
         self.producer.free_len() / FRAME_SAMPLES
     }
+
+    /// How many samples are queued for the speaker and not played yet.
+    pub fn samples_queued(&self) -> usize {
+        self.producer.len()
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +108,19 @@ mod tests {
         assert_eq!(consumer.pop(&mut out), 2 * FRAME_SAMPLES);
         assert_eq!(out[..FRAME_SAMPLES], numbered_frame(0));
         assert_eq!(out[FRAME_SAMPLES..], numbered_frame(1000));
+    }
+
+    // The engine keeps the speaker's queue short by writing only when it runs low.
+    #[test]
+    fn the_engine_sees_how_much_is_queued_for_the_speaker() {
+        let (producer, mut consumer) = ring(4 * FRAME_SAMPLES);
+        let mut frames = PlayoutFrames::new(producer);
+        assert_eq!(frames.samples_queued(), 0);
+        frames.write_frame(&numbered_frame(0));
+        frames.write_frame(&numbered_frame(0));
+        assert_eq!(frames.samples_queued(), 2 * FRAME_SAMPLES);
+        consumer.pop(&mut [0; 300]);
+        assert_eq!(frames.samples_queued(), 2 * FRAME_SAMPLES - 300);
     }
 
     #[test]

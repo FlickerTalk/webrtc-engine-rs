@@ -76,6 +76,16 @@ impl RingProducer {
     pub fn free_len(&self) -> usize {
         self.shared.capacity() - self.shared.len()
     }
+
+    /// How many samples are written and not read yet.
+    pub fn len(&self) -> usize {
+        self.shared.len()
+    }
+
+    /// Whether the reader has taken everything written.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// The reading end.
@@ -150,6 +160,17 @@ mod tests {
         consumer.pop(&mut [0; 2]);
         assert_eq!(consumer.len(), 1);
         assert_eq!(producer.free_len(), 7);
+    }
+
+    // The writer paces itself on what the reader has not taken yet.
+    #[test]
+    fn the_producer_sees_what_is_still_unread() {
+        let (mut producer, mut consumer) = ring(8);
+        assert_eq!(producer.len(), 0);
+        producer.push(&[1, 2, 3]);
+        assert_eq!(producer.len(), 3);
+        consumer.pop(&mut [0; 2]);
+        assert_eq!(producer.len(), 1);
     }
 
     #[test]
