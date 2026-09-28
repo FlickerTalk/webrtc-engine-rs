@@ -2,7 +2,8 @@
 
 use std::ffi::c_void;
 
-use super::{AudioError, SAMPLE_RATE, StreamFormat};
+use super::{AudioError, CaptureAdapter, Counter, RingProducer, SAMPLE_RATE, StreamFormat};
+use std::mem::size_of;
 
 // The few AudioToolbox / CoreAudioTypes declarations this backend needs, copied from the iOS SDK
 // headers (`AUComponent.h`, `AudioUnitProperties.h`, `CoreAudioBaseTypes.h`). The layout tests
@@ -139,6 +140,125 @@ pub(crate) fn device_format(
     })
 }
 
+/// Microphone samples in the unit's sample type, allocated once when the unit starts.
+enum SampleBuffer {
+    I16(Box<[i16]>),
+    F32(Box<[f32]>),
+}
+
+impl SampleBuffer {
+    fn new(kind: SampleKind, samples: usize) -> Self {
+        match kind {
+            SampleKind::I16 => Self::I16(vec![0; samples].into_boxed_slice()),
+            SampleKind::F32 => Self::F32(vec![0.0; samples].into_boxed_slice()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::I16(samples) => samples.len(),
+            Self::F32(samples) => samples.len(),
+        }
+    }
+
+    fn sample_bytes(&self) -> usize {
+        match self {
+            Self::I16(_) => size_of::<i16>(),
+            Self::F32(_) => size_of::<f32>(),
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        match self {
+            Self::I16(samples) => samples.as_mut_ptr().cast(),
+            Self::F32(samples) => samples.as_mut_ptr().cast(),
+        }
+    }
+
+    /// Hands the first `count` samples to `adapter`.
+    fn push_to(&self, adapter: &mut CaptureAdapter, count: usize) {
+        match self {
+            Self::I16(samples) => adapter.push(&samples[..count.min(samples.len())]),
+            Self::F32(samples) => adapter.push(&samples[..count.min(samples.len())]),
+        }
+    }
+}
+
+/// The capture half of the unit's input callback: renders the microphone into a pre-allocated
+/// buffer and hands it to a [`CaptureAdapter`].
+pub(crate) struct Capture {
+    adapter: CaptureAdapter,
+    buffer: SampleBuffer,
+    channels: u32,
+    errors: Counter,
+}
+
+impl Capture {
+    /// A capture for `format` that can take callbacks of up to `max_frames` frames.
+    pub(crate) fn new(
+        format: DeviceFormat,
+        max_frames: u32,
+        producer: RingProducer,
+    ) -> Result<Self, AudioError> {
+        let channels = u32::from(format.stream.channels);
+        // The list tells the unit the buffer's size in bytes as a u32.
+        let samples = max_frames
+            .checked_mul(channels)
+            .filter(|samples| samples.checked_mul(format.kind.bytes()).is_some())
+            .ok_or_else(|| {
+                AudioError::Backend(format!("{max_frames} frames per callback is too many"))
+            })?;
+        Ok(Self {
+            adapter: CaptureAdapter::new(format.stream, producer)?,
+            buffer: SampleBuffer::new(format.kind, samples as usize),
+            channels,
+            errors: Counter::default(),
+        })
+    }
+
+    /// How many callbacks failed to render or were larger than the buffer.
+    pub(crate) fn errors(&self) -> Counter {
+        self.errors.clone()
+    }
+
+    /// How many engine samples were dropped because the ring was full.
+    pub(crate) fn dropped(&self) -> Counter {
+        self.adapter.dropped()
+    }
+
+    /// Runs on the audio thread for every input callback: `render` (`AudioUnitRender` on the
+    /// unit) fills `frames` frames into the buffer the list points at, and they go to the ring.
+    /// No allocation, no lock, no system call besides `render` itself.
+    pub(crate) fn process(
+        &mut self,
+        frames: u32,
+        render: impl FnOnce(&mut AudioBufferList) -> OSStatus,
+    ) {
+        let samples = (frames as usize).saturating_mul(self.channels as usize);
+        if samples > self.buffer.len() {
+            self.errors.add(1);
+            return;
+        }
+        let sample_bytes = self.buffer.sample_bytes();
+        let data = self.buffer.as_mut_ptr();
+        let mut list = AudioBufferList {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: self.channels,
+                // At most the buffer's size, which `new` checked fits in a u32.
+                data_byte_size: (samples * sample_bytes) as u32,
+                data,
+            }],
+        };
+        if render(&mut list) != 0 || list.buffers[0].data != data {
+            self.errors.add(1);
+            return;
+        }
+        let rendered = (list.buffers[0].data_byte_size as usize / sample_bytes).min(samples);
+        self.buffer.push_to(&mut self.adapter, rendered);
+    }
+}
+
 /// Turns the result of the Core Audio function `call` into a `Result`.
 pub(crate) fn check(status: OSStatus, call: &'static str) -> Result<(), AudioError> {
     if status == 0 {
@@ -158,7 +278,9 @@ pub(crate) fn check(status: OSStatus, call: &'static str) -> Result<(), AudioErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::size_of;
+    use crate::audio::RingConsumer;
+    use crate::audio::ring::ring;
+    use std::mem::size_of_val;
 
     #[test]
     fn the_c_types_have_the_sdk_layout() {
@@ -309,6 +431,162 @@ mod tests {
                 "accepted {description:?}"
             );
         }
+    }
+
+    fn drain(consumer: &mut RingConsumer) -> Vec<i16> {
+        let mut all = vec![0; consumer.len()];
+        consumer.pop(&mut all);
+        all
+    }
+
+    /// What a render callback sees of the list it is handed.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        buffers: u32,
+        channels: u32,
+        bytes: u32,
+    }
+
+    fn seen(list: &AudioBufferList) -> Seen {
+        Seen {
+            buffers: list.number_buffers,
+            channels: list.buffers[0].number_channels,
+            bytes: list.buffers[0].data_byte_size,
+        }
+    }
+
+    /// Stands in for `AudioUnitRender`: writes `samples` where the list points.
+    fn write<S: Copy>(list: &mut AudioBufferList, samples: &[S]) {
+        let buffer = &mut list.buffers[0];
+        assert!(size_of_val(samples) <= buffer.data_byte_size as usize);
+        // SAFETY: the list points at a buffer of `data_byte_size` bytes of `S`, checked above.
+        let target =
+            unsafe { std::slice::from_raw_parts_mut(buffer.data.cast::<S>(), samples.len()) };
+        target.copy_from_slice(samples);
+    }
+
+    #[test]
+    fn rendered_i16_samples_reach_the_ring_exactly() {
+        let (producer, mut consumer) = ring(4096);
+        let mut capture =
+            Capture::new(format(SAMPLE_RATE, 1, SampleKind::I16), 512, producer).unwrap();
+        let samples: Vec<i16> = (0..480).map(|n| n * 50 - 12000).collect();
+
+        let mut seen_by_render = None;
+        capture.process(480, |list| {
+            seen_by_render = Some(seen(list));
+            write(list, &samples);
+            0
+        });
+
+        assert_eq!(
+            seen_by_render,
+            Some(Seen {
+                buffers: 1,
+                channels: 1,
+                bytes: 960
+            })
+        );
+        assert_eq!(drain(&mut consumer), samples);
+        assert_eq!(capture.errors().get(), 0);
+    }
+
+    #[test]
+    fn rendered_f32_stereo_is_mixed_to_mono_i16() {
+        let (producer, mut consumer) = ring(4096);
+        let mut capture =
+            Capture::new(format(SAMPLE_RATE, 2, SampleKind::F32), 512, producer).unwrap();
+
+        let mut seen_by_render = None;
+        capture.process(2, |list| {
+            seen_by_render = Some(seen(list));
+            write(list, &[0.5f32, 0.5, -0.25, -0.25]);
+            0
+        });
+
+        assert_eq!(
+            seen_by_render,
+            Some(Seen {
+                buffers: 1,
+                channels: 2,
+                bytes: 16
+            })
+        );
+        assert_eq!(drain(&mut consumer), [16384, -8192]);
+    }
+
+    #[test]
+    fn a_failed_render_pushes_nothing_and_is_counted() {
+        let (producer, mut consumer) = ring(4096);
+        let mut capture =
+            Capture::new(format(SAMPLE_RATE, 1, SampleKind::I16), 512, producer).unwrap();
+        capture.process(256, |list| {
+            write(list, &[1i16; 256]);
+            -10863
+        });
+        assert!(drain(&mut consumer).is_empty());
+        assert_eq!(capture.errors().get(), 1);
+    }
+
+    #[test]
+    fn a_callback_larger_than_the_buffer_is_skipped_and_counted() {
+        let (producer, mut consumer) = ring(4096);
+        let mut capture =
+            Capture::new(format(SAMPLE_RATE, 1, SampleKind::I16), 512, producer).unwrap();
+        let mut rendered = false;
+        capture.process(513, |_| {
+            rendered = true;
+            0
+        });
+        assert!(!rendered);
+        assert!(drain(&mut consumer).is_empty());
+        assert_eq!(capture.errors().get(), 1);
+
+        capture.process(512, |list| {
+            write(list, &[7i16; 512]);
+            0
+        });
+        assert_eq!(drain(&mut consumer), [7; 512]);
+    }
+
+    #[test]
+    fn a_render_that_points_the_list_elsewhere_is_counted_and_ignored() {
+        let (producer, mut consumer) = ring(4096);
+        let mut capture =
+            Capture::new(format(SAMPLE_RATE, 1, SampleKind::I16), 512, producer).unwrap();
+        let mut elsewhere = [5i16; 16];
+        capture.process(16, |list| {
+            list.buffers[0].data = elsewhere.as_mut_ptr().cast();
+            0
+        });
+        assert!(drain(&mut consumer).is_empty());
+        assert_eq!(capture.errors().get(), 1);
+    }
+
+    #[test]
+    fn samples_that_find_the_ring_full_are_counted_as_dropped() {
+        let (producer, _consumer) = ring(8);
+        let mut capture =
+            Capture::new(format(SAMPLE_RATE, 1, SampleKind::I16), 512, producer).unwrap();
+        let dropped = capture.dropped();
+        capture.process(10, |list| {
+            write(list, &[1i16; 10]);
+            0
+        });
+        assert_eq!(dropped.get(), 2);
+    }
+
+    #[test]
+    fn only_the_bytes_the_render_reports_are_pushed() {
+        let (producer, mut consumer) = ring(4096);
+        let mut capture =
+            Capture::new(format(SAMPLE_RATE, 1, SampleKind::I16), 512, producer).unwrap();
+        capture.process(4, |list| {
+            write(list, &[1i16, 2, 3, 4]);
+            list.buffers[0].data_byte_size = 4;
+            0
+        });
+        assert_eq!(drain(&mut consumer), [1, 2]);
     }
 
     #[test]
