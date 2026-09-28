@@ -6,5 +6,12 @@ license = "AGPL-3.0-only"
 description = "Media engine for WebRTC calls on top of webrtc-rs: platform voice processing, Opus and a jitter buffer"
 repository = "https://github.com/FlickerTalk/webrtc-engine-rs"
 
-
 [dependencies]
+bytes = "1"
+rand = "0.10"
+rtc = "0.21"
+webrtc = "0.21"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
