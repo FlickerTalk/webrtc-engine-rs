@@ -18,9 +18,12 @@ pub enum Playout {
 const INITIAL_TARGET: usize = 2;
 
 pub struct JitterBuffer {
-    packets: BTreeMap<u16, Vec<u8>>,
-    /// Sequence the playout clock takes next; `None` until the first playout.
-    next: Option<u16>,
+    /// Keyed by extended sequence, so the order survives the 16-bit wrap.
+    packets: BTreeMap<i64, Vec<u8>>,
+    /// Extended sequence the playout clock takes next; `None` until the first playout.
+    next: Option<i64>,
+    /// Highest extended sequence received: the reference for unwrapping the next one.
+    highest: Option<i64>,
     playing: bool,
     target: usize,
 }
@@ -30,13 +33,33 @@ impl JitterBuffer {
         Self {
             packets: BTreeMap::new(),
             next: None,
+            highest: None,
             playing: false,
             target: INITIAL_TARGET,
         }
     }
 
     pub fn push(&mut self, sequence: u16, payload: Vec<u8>) {
-        self.packets.insert(sequence, payload);
+        let extended = self.extend(sequence);
+        self.packets.insert(extended, payload);
+    }
+
+    /// Unwraps a 16-bit sequence next to the highest one seen: as in RFC 3550, the one within
+    /// half the range (32768) is the right one, whichever side of the wrap it lands on.
+    fn extend(&mut self, sequence: u16) -> i64 {
+        let extended = match self.highest {
+            None => i64::from(sequence),
+            Some(highest) => {
+                // Truncating to u16 then i16 is the modular distance, by design.
+                let delta = sequence.wrapping_sub(highest as u16) as i16;
+                highest + i64::from(delta)
+            }
+        };
+        self.highest = Some(
+            self.highest
+                .map_or(extended, |highest| highest.max(extended)),
+        );
+        extended
     }
 
     /// Called by the playout clock every 20 ms.
@@ -55,7 +78,7 @@ impl JitterBuffer {
             return Playout::Waiting;
         };
         if let Some(payload) = self.packets.remove(&next) {
-            self.next = Some(next.wrapping_add(1));
+            self.next = Some(next + 1);
             return Playout::Frame(payload);
         }
         if self.packets.is_empty() {
@@ -63,7 +86,7 @@ impl JitterBuffer {
             self.playing = false;
             return Playout::Waiting;
         }
-        self.next = Some(next.wrapping_add(1));
+        self.next = Some(next + 1);
         Playout::Missing
     }
 
@@ -132,5 +155,17 @@ mod tests {
         assert_eq!(buffer.playout(), Playout::Waiting);
         buffer.push(4, vec![4]);
         assert_eq!(buffer.playout(), Playout::Frame(vec![3]));
+    }
+
+    // Sequence numbers wrap after 65535: 0 then comes after 65535, not before it.
+    #[test]
+    fn orders_packets_across_the_sequence_wrap() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(0, vec![0]);
+        buffer.push(65535, vec![255]);
+        buffer.push(1, vec![1]);
+        assert_eq!(buffer.pop(), Some(vec![255]));
+        assert_eq!(buffer.pop(), Some(vec![0]));
+        assert_eq!(buffer.pop(), Some(vec![1]));
     }
 }
