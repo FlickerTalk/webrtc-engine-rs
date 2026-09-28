@@ -53,8 +53,15 @@ pub mod fake;
 pub mod h264;
 pub mod packet;
 pub mod rtp;
+
+#[cfg(feature = "desktop")]
+pub mod desktop;
+#[cfg(feature = "openh264")]
+pub mod openh264;
+
 #[cfg(any(target_os = "ios", test))]
 pub mod ios;
+
 // The pure parts (Annex-B, rotation, formats) are tested on the host; the camera and the codecs
 // are Android only.
 #[cfg(any(target_os = "android", test))]
