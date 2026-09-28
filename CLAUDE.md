@@ -24,7 +24,7 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 | `jitter` | `JitterBuffer`: reordena por secuencia (con el salto de 65535 a 0), profundidad adaptativa de 1 a 10 tramas según el jitter RFC 3550 medido con `push_at`; `playout()` → `Frame` / `Missing` / `Waiting`; `peek_next` para la FEC. |
 | `call`   | La cadena. `Uplink` y `Downlink` son máquinas de estado síncronas; `Call` las ejecuta en tres tareas de Tokio (envío, recepción, reproducción). Transporte abstracto: `PacketSink` / `PacketSource`, implementados para `AudioSender`, `AudioReceiver` y `RemoteAudio`. |
 | `netsim` | `NetworkSimulator`: red simulada sans-IO y determinista con semilla (retardo, jitter uniforme, pérdida, reordenación, duplicados). `simulated_link` la usa como transporte de una `Call` con el reloj de Tokio; `simulated_video_link`, como un sentido del vídeo (tramas en paquetes RTP a la ida, peticiones de keyframe a la vuelta). |
-| `video`  | Contrato del vídeo: la plataforma captura **y** codifica (y decodifica **y** pinta) con su hardware; el núcleo solo mueve access units H.264 Annex-B (`EncodedFrame`, SPS/PPS en cada keyframe). `VideoSource`, `VideoSink`, `VideoConfig`, `Facing`, `Rotation` (viaja en la extensión RTP CVO, no se rota el píxel) y el canal `frame_channel` (acotado, sin bloqueo; tras descartar exige keyframe). Puntos de anclaje de iOS/Android/escritorio en la doc del módulo. |
+| `video`  | Contrato del vídeo: la plataforma captura **y** codifica (y decodifica **y** pinta) con su hardware; el núcleo solo mueve access units H.264 Annex-B (`EncodedFrame`, SPS/PPS en cada keyframe). `VideoSource`, `VideoSink`, `VideoConfig`, `Facing`, `Rotation` (viaja en la extensión RTP CVO, no se rota el píxel) y el canal `frame_channel` (acotado, sin bloqueo; tras descartar exige keyframe). Puntos de anclaje de iOS/Android/escritorio en la doc del módulo. `video::ios` (solo iOS): `CameraSource` y `DisplaySink`, ver abajo. |
 | `video::{h264, packet, assemble}` | Núcleo del vídeo, sans-IO: unidades NAL y keyframes (IDR); `Packetizer` (NAL sola, STAP-A con SPS/PPS, FU-A a 1200 bytes, timestamp a 90 kHz desde `EncodedFrame::timestamp`, marcador y rotación en el último paquete); `FrameAssembler` (paquetes → access units Annex-B en orden de decodificación, descarte de tramas incompletas y petición de keyframe). |
 | `video::bitrate` | `BitrateController`: control por pérdidas de los receiver reports (al estilo de la parte de pérdidas de GCC) con tope por REMB; función pura con el tiempo como entrada. |
 | `video::call` | `VideoCall` (tres tareas de Tokio: envío, realimentación, recepción), `RemoteVideo` (paquetes → tramas, PLI), y el transporte abstracto `FrameSink` / `FeedbackSource` / `FrameSource` / `VideoPacketSource`. Independiente de la `Call` de audio. |
@@ -181,6 +181,68 @@ VideoPacketSource (TrackVideoPackets) → RemoteVideo (FrameAssembler, PLI) → 
   las retransmisiones van por el SSRC original), transport-cc solo de recepción (generamos el
   feedback TWCC que usa la estimación de ancho de banda del navegador) y el de feedback.
 
+### Vídeo en iOS (`video::ios`)
+
+Solo `target_os = "ios"`; las partes puras (`h264`, `orientation`, `settings`, `keyframes`) se
+compilan también en los tests del host (`cfg(any(target_os = "ios", test))`).
+
+- **`CameraSource`** (`VideoSource`): `AVCaptureSession` con la cámara gran angular integrada
+  (frontal o trasera), preset más pequeño que cubre `VideoConfig` (352×288, 640×480, 1280×720,
+  1920×1080) → `AVCaptureVideoDataOutput` en NV12 (`420v`), descartando tramas tardías, a un
+  delegado (clase Objective-C definida con objc2) en una cola serie de GCD → ritmo a `fps`
+  (`FramePacer`) → `VTCompressionSession` creada en la primera trama con el tamaño real (y otra
+  vez si cambia al cambiar de cámara) → Annex-B con SPS/PPS delante de cada IDR → `FrameSender`.
+  `switch_camera` cambia la entrada en caliente y fuerza keyframe. `preview_layer()` devuelve el
+  `AVCaptureVideoPreviewLayer`. `set_device_orientation(DeviceOrientation)` y `encode_errors()`.
+- **Codificador**: Constrained Baseline (`kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel`;
+  si no está, Baseline), `RealTime`, `AllowFrameReordering = false` (sin B-frames),
+  `MaxKeyFrameInterval` = 2 s en tramas y `MaxKeyFrameIntervalDuration` = 2 s, `ExpectedFrameRate`,
+  `AverageBitRate` = bitrate acotado y `DataRateLimits` = [1,5 × bitrate / 8 bytes, 1 s] (como
+  libwebrtc). `request_keyframe`, `FrameSender::keyframe_needed` y un codificador nuevo fuerzan
+  keyframe con `kVTEncodeFrameOptionKey_ForceKeyFrame`. `set_bitrate` se aplica en la trama
+  siguiente sin reiniciar. En el simulador sale `42 e0 1e` (Constrained Baseline, nivel 3.0).
+- **Rotación**: no se rota ni se espeja el píxel; la tabla de libwebrtc (`RTCCameraVideoCapturer`):
+  vertical → 90°, boca abajo → 270°, apaisado izquierda → 0° trasera / 180° frontal, apaisado
+  derecha → 180° trasera / 0° frontal; boca arriba/abajo o desconocida mantiene la última.
+- **`DisplaySink`** (`VideoSink`): Annex-B → `CMVideoFormatDescription` desde SPS/PPS (se rehace
+  si cambian) → `CMSampleBuffer` AVCC con `DisplayImmediately` (el ritmo lo pone el jitter buffer)
+  → `enqueueSampleBuffer:` de un **`AVSampleBufferDisplayLayer`**, que decodifica por hardware.
+  La `Rotation` se aplica como `affineTransform` de la capa dentro de un `CATransaction` explícito
+  sin animación. `layer()`, `rotation()`, `keyframe_requests()`.
+- **Petición de keyframe del lado que pinta** (`KeyframeRequests`): un indicador compartido. El
+  `DecodeGate` descarta las tramas delta mientras no haya referencia (al empezar, tras `stop`, tras
+  un fallo de la capa —`status == .failed` o `requiresFlushToResumeDecoding`, que se resuelve con
+  `flush`—, tras una trama que la capa no pudo aceptar o que no era H.264) y pide keyframe como
+  mucho cada 500 ms de tiempo de trama. **El pipeline sondea `take()`** (tras cada `push` o con un
+  temporizador) y, si da `true`, manda un RTCP PLI; las peticiones entre dos sondeos se juntan en
+  una. `total()` cuenta todas.
+- **Contrato con Swift**:
+  - **Capas**: `preview_layer()` y `layer()` son `CALayer` que posee el objeto de Rust, válidas
+    hasta que se suelta. Swift las toma con `Unmanaged<CALayer>.fromOpaque(ptr)
+    .takeUnretainedValue()`, las añade como subcapas **en el hilo principal**, las coloca en
+    `layoutSubviews` y las quita antes de soltar el objeto. Con rotación de 90°/270° la capa
+    remota se coloca con `bounds` (ancho y alto cambiados) y `position`, nunca con `frame`.
+  - **Permiso**: la app declara `NSCameraUsageDescription` y pide acceso
+    (`AVCaptureDevice.requestAccess(for: .video)`) antes de la videollamada. El motor no lo pide:
+    `start` devuelve `PermissionDenied` si no está concedido (sin preguntar aún también cuenta
+    como denegado; es lo que da el simulador).
+  - **Orientación**: UIKit es solo del hilo principal, así que la app llama a
+    `set_device_orientation(DeviceOrientation::from_raw(UIDevice.current.orientation.rawValue))`
+    desde su observador de `orientationDidChangeNotification`. Empieza en vertical.
+  - **`AVAudioSession`**: no se toca; es de la app y de CallKit.
+- **FFI**: VideoToolbox, CoreMedia, CoreVideo, CoreFoundation y libdispatch son C y se declaran a
+  mano en `video/ios/ffi.rs` (con `const` que fijan el tamaño de `CMTime`, `CMSampleTimingInfo`,
+  `CGAffineTransform`…). AVFoundation y Core Animation van por **`objc2` solo** (dependencia solo
+  para iOS): define la clase del delegado, lleva los retain/release y comprueba en debug la
+  codificación de tipos de cada mensaje. Los crates generados (`objc2-av-foundation` y familia)
+  traerían media docena de crates y decenas de features para unos treinta mensajes.
+- **Tiempo real**: el callback de captura no espera nunca (`try_lock` del estado; el hilo del
+  motor solo lo coge con la cola drenada), el de VideoToolbox copia y hace `try_send`. Crear el
+  codificador (primera trama, cambio de tamaño) sí ocurre en la cola de captura.
+- **Parada**: `stopRunning`, quitar el delegado, drenar la cola (`dispatch_sync_f`) y soltar el
+  estado de captura; soltar el codificador espera sus tramas pendientes y lo invalida antes de
+  liberar su salida.
+
 ## Decisiones y por qué
 
 - **libopus vendorizada y compilada con `cc`**: los crates que la traen usan cmake, que no está en
@@ -217,6 +279,15 @@ cargo run --example mic_echo --features desktop    # solo dispositivos, 200 ms d
 IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --target aarch64-apple-ios
 IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --target aarch64-apple-ios-sim
 IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo clippy --all-targets --target aarch64-apple-ios -- -D warnings
+
+# Tests del vídeo de iOS en el simulador (uno arrancado: xcrun simctl list devices booted). Sin
+# cámara: los #[ignore] codifican tramas NV12 sintéticas con VideoToolbox, las decodifican con
+# VTDecompressionSession y con DisplaySink, y llaman al delegado de captura con CMSampleBuffers
+# sintéticos.
+IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo test --target aarch64-apple-ios-sim --lib --no-run
+xcrun simctl spawn <id> target/aarch64-apple-ios-sim/debug/deps/webrtc_engine-<hash> video::ios
+xcrun simctl spawn <id> target/aarch64-apple-ios-sim/debug/deps/webrtc_engine-<hash> \
+  --ignored --test-threads 1 video::ios
 
 # Tests en el simulador de iOS (con uno arrancado: xcrun simctl list devices booted). El binario
 # se lanza con simctl spawn, sin instalar ninguna app; los #[ignore] usan la unidad de voz real
@@ -291,6 +362,13 @@ target. Sin secretos.
   el número de secuencia del FIR no se usa para deduplicar; probar la interoperabilidad real con
   Chrome, Safari y el WebView (answer de un navegador, perfiles H.264 que ofrece, lectura de la
   CVO y del PLI con `sender_ssrc`); las fuentes y sumideros de plataforma (ramas aparte).
+- **Vídeo iOS**: probarlo con la cámara real del iPhone (en el simulador no hay cámara) y con la
+  pantalla bloqueada/en segundo plano (la cámara se para; la capa se vacía y debe pedir keyframe).
+  El delegado no se declara conforme al protocolo `AVCaptureVideoDataOutputSampleBufferDelegate`
+  (AVFoundation solo mira `respondsToSelector:`); confirmarlo en el dispositivo. La frecuencia de
+  la cámara no se fija (`activeVideoMinFrameDuration`): se diezman tramas. En iOS 17+ los métodos de
+  encolar de la capa pasan a `sampleBufferRenderer`; con objetivo 15 se usan los de la capa.
+  Contador de fallos de la capa y de tramas descartadas por el `DecodeGate` para las estadísticas.
 
 ## Estado (2026-09-28)
 
@@ -341,3 +419,10 @@ constantes unificadas en la raíz del crate y `Cargo.lock` versionado. Hecho enc
   tramas en orden, sin peticiones; 1 % de pérdida y reordenación: se piden keyframes, llegan a la
   cámara y la pantalla nunca muestra basura) y en loopback real (Opus y H.264 en la misma
   conexión, rotación por CVO, PLI hasta la cámara).
+- Rama `video-ios`: `video::ios` (`CameraSource`, `DisplaySink`, `KeyframeRequests`,
+  `DeviceOrientation`). En el simulador de iOS 27 pasan los 11 tests `#[ignore]`: 30 tramas
+  sintéticas → Annex-B con SPS/PPS en el primer keyframe → 30 imágenes 640×480 decodificadas por
+  `VTDecompressionSession`, y la misma secuencia en `DisplaySink` sin pedir keyframes con la capa
+  en `.rendering`; keyframe forzado y cambio de bitrate en vivo; delegado de captura con ritmo,
+  rotación y cambio de tamaño; `start` sin permiso → `PermissionDenied`. Sin probar aún en el
+  iPhone.
