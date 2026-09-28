@@ -11,16 +11,16 @@ use crate::video::{Facing, Rotation};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceOrientation {
     #[default]
-    Unknown,
+    Unknown = 0,
     /// Upright, home button or bar at the bottom.
-    Portrait,
-    PortraitUpsideDown,
+    Portrait = 1,
+    PortraitUpsideDown = 2,
     /// On its side, the top of the phone to the left.
-    LandscapeLeft,
+    LandscapeLeft = 3,
     /// On its side, the top of the phone to the right.
-    LandscapeRight,
-    FaceUp,
-    FaceDown,
+    LandscapeRight = 4,
+    FaceUp = 5,
+    FaceDown = 6,
 }
 
 impl DeviceOrientation {
