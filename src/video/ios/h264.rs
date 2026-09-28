@@ -21,7 +21,8 @@ pub(crate) enum H264Error {
 
 /// The type of a NAL unit, from its header byte; `None` for an empty unit.
 pub(crate) fn nal_type(nal: &[u8]) -> Option<u8> {
-    nal.first().map(|&header| crate::video::h264::nal_type(header))
+    nal.first()
+        .map(|&header| crate::video::h264::nal_type(header))
 }
 
 /// Splits AVCC data (each NAL unit behind a big-endian length of `length_size` bytes).
