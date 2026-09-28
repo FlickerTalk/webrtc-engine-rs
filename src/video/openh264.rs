@@ -138,6 +138,35 @@ impl I420Frame {
         out
     }
 
+    /// A synthetic moving picture, frame `index` of a sequence, for tests and demos.
+    ///
+    /// A gradient with a fine texture and a bright square moving across it, so that consecutive
+    /// frames differ as camera frames do.
+    pub fn test_pattern(width: u32, height: u32, index: u32) -> Result<Self, VideoError> {
+        plane_sizes(width, height)?;
+        let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+        let square = index.wrapping_mul(8) % width;
+        for y in 0..height {
+            for x in 0..width {
+                let inside = (square..square + 48).contains(&x) && (40..88).contains(&y);
+                // A triangle wave: texture without the hard edges a sawtooth would draw.
+                let phase = (x.wrapping_mul(7) + y.wrapping_mul(13) + index.wrapping_mul(3)) % 64;
+                let texture = phase.min(63 - phase) as u8;
+                let pixel = if inside {
+                    [240, 230, 40]
+                } else {
+                    [
+                        (u64::from(x) * 127 / u64::from(width)) as u8 + texture,
+                        (u64::from(y) * 127 / u64::from(height)) as u8 + texture,
+                        96 + texture,
+                    ]
+                };
+                rgb.extend_from_slice(&pixel);
+            }
+        }
+        Self::from_rgb(width, height, &rgb)
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -433,30 +462,8 @@ fn clamp_u8(value: i32) -> u8 {
 mod tests {
     use super::*;
 
-    /// A textured picture with a bright square moving across it, so that consecutive frames
-    /// differ as camera frames do.
     fn moving_pattern(width: u32, height: u32, index: u32) -> I420Frame {
-        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-        let square = (index * 8) % width;
-        for y in 0..height {
-            for x in 0..width {
-                let inside = (square..square + 48).contains(&x) && (40..88).contains(&y);
-                // A triangle wave: texture without the hard edges a sawtooth would draw.
-                let phase = (x * 7 + y * 13 + index * 3) % 64;
-                let texture = phase.min(63 - phase) as u8;
-                let pixel = if inside {
-                    [240, 230, 40]
-                } else {
-                    [
-                        (x * 255 / width) as u8 / 2 + texture,
-                        (y * 255 / height) as u8 / 2 + texture,
-                        96 + texture,
-                    ]
-                };
-                rgb.extend_from_slice(&pixel);
-            }
-        }
-        I420Frame::from_rgb(width, height, &rgb).unwrap()
+        I420Frame::test_pattern(width, height, index).unwrap()
     }
 
     fn encoder() -> SoftwareEncoder {
@@ -644,6 +651,19 @@ mod tests {
             .unwrap();
         assert_eq!(decoder.decode(&delta.data), Ok(None));
         assert!(decoder.needs_keyframe());
+    }
+
+    #[test]
+    fn the_test_pattern_moves_from_frame_to_frame() {
+        let first = I420Frame::test_pattern(64, 48, 0).unwrap();
+        let second = I420Frame::test_pattern(64, 48, 1).unwrap();
+        assert_eq!((first.width(), first.height()), (64, 48));
+        assert_ne!(first, second);
+        assert_eq!(first, I420Frame::test_pattern(64, 48, 0).unwrap());
+        assert_eq!(
+            I420Frame::test_pattern(63, 48, 0),
+            Err(VideoError::Unsupported)
+        );
     }
 
     fn flat_rgb(width: u32, height: u32, colour: [u8; 3]) -> Vec<u8> {
