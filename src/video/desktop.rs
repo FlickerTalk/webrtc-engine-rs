@@ -83,6 +83,11 @@ impl CapturePipeline {
     }
 }
 
+/// The camera after `current` among `count`, wrapping around; `None` with fewer than two.
+fn next_camera(current: usize, count: usize) -> Option<usize> {
+    (count >= 2).then(|| (current + 1) % count)
+}
+
 /// A decoded or captured picture and how to turn it to show it upright.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picture {
@@ -380,6 +385,15 @@ mod tests {
         let (mut pipeline, frames, _) = pipeline(3);
         drop(frames);
         assert_eq!(pipeline.process(pattern(0), at(0)), Ok(SendOutcome::Closed));
+    }
+
+    #[test]
+    fn switching_goes_to_the_next_camera_and_wraps_around() {
+        assert_eq!(next_camera(0, 2), Some(1));
+        assert_eq!(next_camera(1, 2), Some(0));
+        assert_eq!(next_camera(1, 3), Some(2));
+        assert_eq!(next_camera(0, 1), None);
+        assert_eq!(next_camera(0, 0), None);
     }
 
     #[test]
