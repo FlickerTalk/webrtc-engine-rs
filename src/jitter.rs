@@ -14,6 +14,25 @@ pub enum Playout {
     Waiting,
 }
 
+/// Counters since the buffer was created, plus the current depth.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Packets pushed, whatever became of them.
+    pub received: u64,
+    /// Frames handed to the decoder.
+    pub played: u64,
+    /// `Missing` frames the decoder had to conceal.
+    pub concealed: u64,
+    /// Packets dropped because their turn had already been played or concealed.
+    pub late: u64,
+    /// Packets dropped because the same sequence was already buffered.
+    pub duplicate: u64,
+    /// Packets stored now.
+    pub depth: usize,
+    /// Depth the playout aims for, in 20 ms frames.
+    pub target: usize,
+}
+
 /// Playout depth before the first frame, in 20 ms frames.
 const INITIAL_TARGET: usize = 2;
 
@@ -26,6 +45,7 @@ pub struct JitterBuffer {
     highest: Option<i64>,
     playing: bool,
     target: usize,
+    counts: Stats,
 }
 
 impl JitterBuffer {
@@ -36,11 +56,21 @@ impl JitterBuffer {
             highest: None,
             playing: false,
             target: INITIAL_TARGET,
+            counts: Stats::default(),
         }
     }
 
     pub fn push(&mut self, sequence: u16, payload: Vec<u8>) {
+        self.counts.received += 1;
         let extended = self.extend(sequence);
+        if self.next.is_some_and(|next| extended < next) {
+            self.counts.late += 1;
+            return;
+        }
+        if self.packets.contains_key(&extended) {
+            self.counts.duplicate += 1;
+            return;
+        }
         self.packets.insert(extended, payload);
     }
 
@@ -62,6 +92,14 @@ impl JitterBuffer {
         extended
     }
 
+    pub fn stats(&self) -> Stats {
+        Stats {
+            depth: self.packets.len(),
+            target: self.target,
+            ..self.counts.clone()
+        }
+    }
+
     /// Called by the playout clock every 20 ms.
     pub fn playout(&mut self) -> Playout {
         if !self.playing {
@@ -79,6 +117,7 @@ impl JitterBuffer {
         };
         if let Some(payload) = self.packets.remove(&next) {
             self.next = Some(next + 1);
+            self.counts.played += 1;
             return Playout::Frame(payload);
         }
         if self.packets.is_empty() {
@@ -87,6 +126,7 @@ impl JitterBuffer {
             return Playout::Waiting;
         }
         self.next = Some(next + 1);
+        self.counts.concealed += 1;
         Playout::Missing
     }
 
@@ -167,5 +207,50 @@ mod tests {
         assert_eq!(buffer.pop(), Some(vec![255]));
         assert_eq!(buffer.pop(), Some(vec![0]));
         assert_eq!(buffer.pop(), Some(vec![1]));
+    }
+
+    // A packet the network delivered twice plays once.
+    #[test]
+    fn drops_duplicates() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(1, vec![1]);
+        buffer.push(1, vec![9]);
+        buffer.push(2, vec![2]);
+        assert_eq!(buffer.pop(), Some(vec![1]));
+        assert_eq!(buffer.pop(), Some(vec![2]));
+        let stats = buffer.stats();
+        assert_eq!(stats.received, 3);
+        assert_eq!(stats.duplicate, 1);
+        assert_eq!(stats.played, 2);
+    }
+
+    // Once its turn has been played or concealed, a packet is useless: playing it later would
+    // put the audio out of order.
+    #[test]
+    fn drops_packets_whose_turn_has_passed() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(1, vec![1]);
+        buffer.push(3, vec![3]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![1]));
+        assert_eq!(buffer.playout(), Playout::Missing);
+        buffer.push(2, vec![2]);
+        buffer.push(1, vec![1]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![3]));
+        assert_eq!(buffer.playout(), Playout::Waiting);
+        let stats = buffer.stats();
+        assert_eq!(stats.late, 2);
+        assert_eq!(stats.concealed, 1);
+        assert_eq!(stats.played, 2);
+        assert_eq!(stats.depth, 0);
+    }
+
+    #[test]
+    fn stats_show_the_current_depth_and_target() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(1, vec![1]);
+        buffer.push(2, vec![2]);
+        let stats = buffer.stats();
+        assert_eq!(stats.depth, 2);
+        assert_eq!(stats.target, 2);
     }
 }
