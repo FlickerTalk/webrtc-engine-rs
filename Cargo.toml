@@ -43,3 +43,8 @@ test = true
 name = "call_demo"
 required-features = ["desktop"]
 test = true
+
+[[example]]
+name = "video_demo"
+required-features = ["desktop"]
+test = true
