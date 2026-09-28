@@ -14,13 +14,19 @@ pub const NAL_PPS: u8 = 8;
 /// NAL unit type of an access unit delimiter.
 pub const NAL_AUD: u8 = 9;
 
+/// The four-byte Annex-B start code, the one this crate and the platform code write.
+pub const START_CODE: [u8; 4] = [0, 0, 0, 1];
+
 /// The type of a NAL unit, from its header byte.
 pub fn nal_type(header: u8) -> u8 {
     header & 0x1F
 }
 
 /// The NAL units of an Annex-B access unit, without their start codes. Either start code
-/// (`00 00 01` or `00 00 00 01`) is accepted; bytes before the first start code are ignored.
+/// (`00 00 01` or `00 00 00 01`) is accepted; bytes before the first start code, empty units and
+/// the zero bytes that trail a unit (the first byte of a four-byte start code, or
+/// `trailing_zero_8bits`) are left out. A NAL unit never ends in a zero byte (its RBSP trailing
+/// bits), so no unit loses a byte of its own.
 pub fn nal_units(data: &[u8]) -> Vec<&[u8]> {
     let mut units = Vec::new();
     let mut start = None;
@@ -37,7 +43,7 @@ pub fn nal_units(data: &[u8]) -> Vec<&[u8]> {
         }
     }
     if let Some(begin) = start {
-        units.push(&data[begin..]);
+        units.push(trim_trailing_zeros(&data[begin..]));
     }
     units.retain(|unit| !unit.is_empty());
     units
@@ -98,6 +104,23 @@ mod tests {
         let unit: &[u8] = &[0x41, 0x00, 0x00, 0x03, 0x01, 0x80];
         let data = annex_b(&[unit, IDR]);
         assert_eq!(nal_units(&data), vec![unit, IDR]);
+    }
+
+    #[test]
+    fn leaves_out_zero_bytes_after_the_last_nal_unit_and_empty_units() {
+        // `trailing_zero_8bits` after the last unit, and a start code with nothing behind it.
+        let mut data = vec![0, 0, 1];
+        data.extend_from_slice(SLICE);
+        data.extend_from_slice(&[0, 0, 0, 1, 0, 0, 1]);
+        data.extend_from_slice(IDR);
+        data.extend_from_slice(&[0, 0]);
+        assert_eq!(nal_units(&data), vec![SLICE, IDR]);
+    }
+
+    #[test]
+    fn the_start_code_it_writes_is_the_four_byte_one() {
+        assert_eq!(START_CODE, [0, 0, 0, 1]);
+        assert_eq!(nal_units(&[&START_CODE[..], IDR].concat()), vec![IDR]);
     }
 
     #[test]
