@@ -47,6 +47,7 @@
 //!   and the desktop.
 
 pub mod assemble;
+pub mod bitrate;
 pub mod h264;
 pub mod packet;
 
