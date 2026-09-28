@@ -1,0 +1,10 @@
+[package]
+name = "webrtc-engine"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Media engine for WebRTC calls on top of webrtc-rs: platform voice processing, Opus and a jitter buffer"
+repository = "https://github.com/FlickerTalk/webrtc-engine-rs"
+
+
+[dependencies]
