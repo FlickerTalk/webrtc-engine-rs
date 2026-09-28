@@ -1,6 +1,7 @@
 //! Media engine for WebRTC calls, on top of webrtc-rs.
 //!
-//! Every module works in one audio format: 48 kHz, mono, i16 PCM, in frames of 20 ms.
+//! Every audio module works in one format: 48 kHz, mono, i16 PCM, in frames of 20 ms. Video
+//! (`video`) only moves encoded H.264 access units; the platforms keep the pixels.
 
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ pub mod codec;
 pub mod jitter;
 pub mod netsim;
 pub mod rtp;
+pub mod video;
 
 /// The engine's sample rate, in Hz: Opus' native rate, so nothing is resampled between the
 /// codec and the rings.
