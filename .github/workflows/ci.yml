@@ -35,8 +35,10 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       # Tests that need a microphone stay #[ignore]; the loopback call uses 127.0.0.1 only.
       - run: cargo test --all-features --locked
-      - name: iOS build
-        run: cargo build --target aarch64-apple-ios --locked
+      - name: iOS lints and build
+        run: |
+          cargo clippy --all-targets --target aarch64-apple-ios --locked -- -D warnings
+          cargo build --target aarch64-apple-ios --locked
         env:
           # Without it clang stamps libopus with the SDK version as minimum iOS.
           IPHONEOS_DEPLOYMENT_TARGET: "15.0"
