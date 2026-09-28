@@ -1,4 +1,50 @@
 //! iOS backend on the `VoiceProcessingIO` audio unit.
+//!
+//! [`VoiceProcessingBackend`] (iOS only) runs Apple's voice-processing I/O unit: echo
+//! cancellation, noise suppression and automatic gain control done by the system, the
+//! microphone on bus 1 and the speaker, receiver or headset on bus 0.
+//!
+//! # Contract with the app (Swift and CallKit)
+//!
+//! **This backend never configures or activates `AVAudioSession`.** The session belongs to the
+//! app, and with CallKit the system activates it:
+//!
+//! 1. The app's Swift code sets the category and mode before the call is reported or answered:
+//!    `.playAndRecord` with mode `.voiceChat` (options such as `.allowBluetooth` are the app's
+//!    choice). It does not call `setActive(true)` itself: CallKit does.
+//! 2. In `CXProviderDelegate.provider(_:didActivate:)` the app calls
+//!    [`AudioBackend::start`](super::AudioBackend::start). Not before: without an active
+//!    session that can record, the unit initialises but refuses to start (OSStatus -66637).
+//! 3. In `provider(_:didDeactivate:)`, and when the call ends, the app calls
+//!    [`AudioBackend::stop`](super::AudioBackend::stop). If an interruption ends and CallKit
+//!    activates the session again, the app stops and starts the backend again.
+//! 4. The app declares `NSMicrophoneUsageDescription` and the `audio` and `voip` background
+//!    modes. Only one voice-processing unit may run per process, so the WebView must not hold
+//!    the microphone during a native call.
+//!
+//! Routes (speaker, receiver, Bluetooth) are the session's business too: the unit follows them.
+//!
+//! # Formats
+//!
+//! The backend asks for 48 kHz mono i16 on both sides (the engine's own format, copied bit for
+//! bit), or f32 if the unit refuses i16. After `AudioUnitInitialize` it reads back what the unit
+//! actually gives and hands that to the [`CaptureAdapter`] and [`PlayoutAdapter`], which convert
+//! any rate, interleaved channel count and i16 or f32.
+//!
+//! # Real time
+//!
+//! The callbacks take no lock, allocate nothing and make no system call besides
+//! `AudioUnitRender`. The microphone buffer is allocated at start for the unit's maximum slice,
+//! which the backend raises to 4096 frames, what iOS uses with the screen locked. A callback
+//! that fails is counted ([`VoiceProcessingBackend::capture_errors`]), never raised. `stop`
+//! stops and uninitialises the unit before the callback state is freed, so nothing is freed on
+//! the audio thread; `Drop` does the same and then disposes of the unit.
+//!
+//! # FFI
+//!
+//! The dozen AudioToolbox declarations are written by hand, from the SDK headers, with tests
+//! pinning the struct layouts: `coreaudio-sys` would need bindgen and libclang at build time,
+//! and `objc2-audio-toolbox` brings a family of generated crates, both for ten functions.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -54,6 +100,35 @@ pub(crate) struct AudioBuffer {
 pub(crate) struct AudioBufferList {
     pub number_buffers: u32,
     pub buffers: [AudioBuffer; 1],
+}
+
+/// `AudioComponentDescription`: which audio unit to look for.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AudioComponentDescription {
+    pub component_type: u32,
+    pub component_sub_type: u32,
+    pub component_manufacturer: u32,
+    pub component_flags: u32,
+    pub component_flags_mask: u32,
+}
+
+/// `AURenderCallback`: the input and render callbacks.
+pub(crate) type AURenderCallback = unsafe extern "C" fn(
+    ref_con: *mut c_void,
+    action_flags: *mut u32,
+    time_stamp: *const AudioTimeStamp,
+    bus: u32,
+    frames: u32,
+    data: *mut AudioBufferList,
+) -> OSStatus;
+
+/// `AURenderCallbackStruct`: a callback and the pointer it gets back.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AURenderCallbackStruct {
+    pub input_proc: Option<AURenderCallback>,
+    pub input_proc_ref_con: *mut c_void,
 }
 
 /// The sample type of a stream the adapters can take.
@@ -369,6 +444,472 @@ pub(crate) unsafe extern "C" fn render_callback(
     }
 }
 
+#[cfg(target_os = "ios")]
+pub use unit::VoiceProcessingBackend;
+
+#[cfg(target_os = "ios")]
+mod unit {
+    use std::ptr;
+
+    use super::super::{AudioBackend, DeviceIo};
+    use super::*;
+
+    type AudioComponent = *mut c_void;
+    type AudioUnit = *mut c_void;
+
+    const K_AUDIO_UNIT_TYPE_OUTPUT: u32 = u32::from_be_bytes(*b"auou");
+    const K_AUDIO_UNIT_SUB_TYPE_VOICE_PROCESSING_IO: u32 = u32::from_be_bytes(*b"vpio");
+    const K_AUDIO_UNIT_MANUFACTURER_APPLE: u32 = u32::from_be_bytes(*b"appl");
+
+    const K_AUDIO_UNIT_SCOPE_GLOBAL: u32 = 0;
+    const K_AUDIO_UNIT_SCOPE_INPUT: u32 = 1;
+    const K_AUDIO_UNIT_SCOPE_OUTPUT: u32 = 2;
+
+    const K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT: u32 = 8;
+    const K_AUDIO_UNIT_PROPERTY_MAXIMUM_FRAMES_PER_SLICE: u32 = 14;
+    const K_AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK: u32 = 23;
+    const K_AUDIO_UNIT_PROPERTY_SHOULD_ALLOCATE_BUFFER: u32 = 51;
+    const K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO: u32 = 2003;
+    const K_AUDIO_OUTPUT_UNIT_PROPERTY_SET_INPUT_CALLBACK: u32 = 2005;
+
+    /// Element 1 of an I/O unit is the microphone; its output scope is what the app reads.
+    const INPUT_BUS: u32 = 1;
+    /// Element 0 is the speaker; its input scope is what the app plays.
+    const OUTPUT_BUS: u32 = 0;
+    /// Apple's advice for a unit that must keep running with the screen locked, where iOS
+    /// asks for larger slices (4096 frames) than the default 1156.
+    const MAX_FRAMES_PER_SLICE: u32 = 4096;
+
+    #[link(name = "AudioToolbox", kind = "framework")]
+    unsafe extern "C" {
+        fn AudioComponentFindNext(
+            component: AudioComponent,
+            description: *const AudioComponentDescription,
+        ) -> AudioComponent;
+        fn AudioComponentInstanceNew(component: AudioComponent, unit: *mut AudioUnit) -> OSStatus;
+        fn AudioComponentInstanceDispose(unit: AudioUnit) -> OSStatus;
+        fn AudioUnitSetProperty(
+            unit: AudioUnit,
+            id: u32,
+            scope: u32,
+            element: u32,
+            data: *const c_void,
+            size: u32,
+        ) -> OSStatus;
+        fn AudioUnitGetProperty(
+            unit: AudioUnit,
+            id: u32,
+            scope: u32,
+            element: u32,
+            data: *mut c_void,
+            size: *mut u32,
+        ) -> OSStatus;
+        fn AudioUnitInitialize(unit: AudioUnit) -> OSStatus;
+        fn AudioUnitUninitialize(unit: AudioUnit) -> OSStatus;
+        fn AudioOutputUnitStart(unit: AudioUnit) -> OSStatus;
+        fn AudioOutputUnitStop(unit: AudioUnit) -> OSStatus;
+        fn AudioUnitRender(
+            unit: AudioUnit,
+            action_flags: *mut u32,
+            time_stamp: *const AudioTimeStamp,
+            bus: u32,
+            frames: u32,
+            data: *mut AudioBufferList,
+        ) -> OSStatus;
+    }
+
+    /// What the input callback needs: the unit, to render the microphone from, and the capture.
+    struct Input {
+        unit: AudioUnit,
+        capture: Capture,
+    }
+
+    /// The unit's input callback: the microphone has `frames` frames ready. `ref_con` is the
+    /// [`Input`]; `data` is null, the samples are fetched with `AudioUnitRender`.
+    unsafe extern "C" fn input_callback(
+        ref_con: *mut c_void,
+        action_flags: *mut u32,
+        time_stamp: *const AudioTimeStamp,
+        bus: u32,
+        frames: u32,
+        _data: *mut AudioBufferList,
+    ) -> OSStatus {
+        // SAFETY: `ref_con` is the boxed `Input` registered in `start`, which outlives the
+        // running unit and is only touched by this callback while it runs.
+        let input = unsafe { &mut *ref_con.cast::<Input>() };
+        let unit = input.unit;
+        input.capture.process(frames, |list| {
+            // SAFETY: the flags and time stamp are the unit's own for this callback, and
+            // `list` points at the capture's buffer, sized for `frames` frames.
+            unsafe { AudioUnitRender(unit, action_flags, time_stamp, bus, frames, list) }
+        });
+        0
+    }
+
+    /// The callback state of a started unit. The unit holds raw pointers into both boxes, so
+    /// they are freed only once the unit can no longer call back.
+    struct Running {
+        _input: Box<Input>,
+        _playout: Box<Playout>,
+    }
+
+    /// The `VoiceProcessingIO` unit: the microphone with the platform's echo cancellation,
+    /// noise suppression and gain control, and the speaker or receiver.
+    ///
+    /// It never touches `AVAudioSession`: see the module documentation for the contract with
+    /// the app.
+    pub struct VoiceProcessingBackend {
+        unit: AudioUnit,
+        running: Option<Running>,
+        capture_dropped: Counter,
+        playout_underruns: Counter,
+        capture_errors: Counter,
+    }
+
+    // SAFETY: the unit handle may be used from any thread; Core Audio serialises property
+    // calls on its own. The callback state behind `running` is only reached by the unit's
+    // real-time thread while it runs and by `stop`/`drop` after it stopped, both through
+    // `&mut self`, so moving the owner to another thread shares nothing.
+    unsafe impl Send for VoiceProcessingBackend {}
+
+    impl VoiceProcessingBackend {
+        /// Creates the unit, stopped. Fails if the system has no `VoiceProcessingIO`.
+        pub fn new() -> Result<Self, AudioError> {
+            let description = AudioComponentDescription {
+                component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
+                component_sub_type: K_AUDIO_UNIT_SUB_TYPE_VOICE_PROCESSING_IO,
+                component_manufacturer: K_AUDIO_UNIT_MANUFACTURER_APPLE,
+                component_flags: 0,
+                component_flags_mask: 0,
+            };
+            // SAFETY: a valid description; a null component starts the search from the first.
+            let component = unsafe { AudioComponentFindNext(ptr::null_mut(), &description) };
+            if component.is_null() {
+                return Err(AudioError::NoDevice);
+            }
+            let mut unit: AudioUnit = ptr::null_mut();
+            // SAFETY: `component` was just found and `unit` is a valid place for the instance.
+            check(
+                unsafe { AudioComponentInstanceNew(component, &mut unit) },
+                "AudioComponentInstanceNew",
+            )?;
+            if unit.is_null() {
+                return Err(AudioError::NoDevice);
+            }
+            Ok(Self {
+                unit,
+                running: None,
+                capture_dropped: Counter::default(),
+                playout_underruns: Counter::default(),
+                capture_errors: Counter::default(),
+            })
+        }
+
+        /// Captured samples lost because the engine did not read in time, since the last start.
+        pub fn capture_dropped(&self) -> Counter {
+            self.capture_dropped.clone()
+        }
+
+        /// Speaker callbacks that played silence, since the last start.
+        pub fn playout_underruns(&self) -> Counter {
+            self.playout_underruns.clone()
+        }
+
+        /// Input callbacks that failed to render the microphone, since the last start.
+        pub fn capture_errors(&self) -> Counter {
+            self.capture_errors.clone()
+        }
+
+        fn set<T>(&self, id: u32, scope: u32, element: u32, value: &T) -> Result<(), AudioError> {
+            // SAFETY: `value` is a live `T` of the size given, the type the property takes.
+            let status = unsafe {
+                AudioUnitSetProperty(
+                    self.unit,
+                    id,
+                    scope,
+                    element,
+                    (value as *const T).cast(),
+                    size_of::<T>() as u32,
+                )
+            };
+            check(status, "AudioUnitSetProperty")
+        }
+
+        fn get<T: Default>(&self, id: u32, scope: u32, element: u32) -> Result<T, AudioError> {
+            let mut value = T::default();
+            let mut size = size_of::<T>() as u32;
+            // SAFETY: `value` has room for the `size` bytes of the property's type `T`.
+            let status = unsafe {
+                AudioUnitGetProperty(
+                    self.unit,
+                    id,
+                    scope,
+                    element,
+                    (&mut value as *mut T).cast(),
+                    &mut size,
+                )
+            };
+            check(status, "AudioUnitGetProperty")?;
+            Ok(value)
+        }
+
+        /// Sets the stream the app reads from the microphone and the one it plays.
+        fn set_client_format(&self, kind: SampleKind) -> Result<(), AudioError> {
+            let format = requested_format(kind);
+            let stream = K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT;
+            self.set(stream, K_AUDIO_UNIT_SCOPE_OUTPUT, INPUT_BUS, &format)?;
+            self.set(stream, K_AUDIO_UNIT_SCOPE_INPUT, OUTPUT_BUS, &format)
+        }
+
+        /// Everything that must be set before `AudioUnitInitialize`.
+        fn configure(&self) -> Result<(), AudioError> {
+            let enable_io = K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO;
+            self.set(enable_io, K_AUDIO_UNIT_SCOPE_INPUT, INPUT_BUS, &1u32)?;
+            self.set(enable_io, K_AUDIO_UNIT_SCOPE_OUTPUT, OUTPUT_BUS, &1u32)?;
+            // The input callback renders into the capture's own buffer.
+            let allocate = K_AUDIO_UNIT_PROPERTY_SHOULD_ALLOCATE_BUFFER;
+            self.set(allocate, K_AUDIO_UNIT_SCOPE_OUTPUT, INPUT_BUS, &0u32)?;
+            let max_frames = K_AUDIO_UNIT_PROPERTY_MAXIMUM_FRAMES_PER_SLICE;
+            self.set(
+                max_frames,
+                K_AUDIO_UNIT_SCOPE_GLOBAL,
+                0,
+                &MAX_FRAMES_PER_SLICE,
+            )?;
+            // i16 is the engine's own format; f32 if the unit will not take it.
+            self.set_client_format(SampleKind::I16)
+                .or_else(|_| self.set_client_format(SampleKind::F32))
+        }
+
+        /// Reads back what the initialised unit gives, builds the callback state and starts.
+        fn start_initialized(&mut self, io: DeviceIo) -> Result<(), AudioError> {
+            let stream = K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT;
+            let capture_format =
+                device_format(&self.get(stream, K_AUDIO_UNIT_SCOPE_OUTPUT, INPUT_BUS)?)?;
+            let playout_format =
+                device_format(&self.get(stream, K_AUDIO_UNIT_SCOPE_INPUT, OUTPUT_BUS)?)?;
+            let max_frames: u32 = self.get(
+                K_AUDIO_UNIT_PROPERTY_MAXIMUM_FRAMES_PER_SLICE,
+                K_AUDIO_UNIT_SCOPE_GLOBAL,
+                0,
+            )?;
+
+            let capture = Capture::new(capture_format, max_frames, io.capture)?;
+            let playout = Playout::new(playout_format, io.playout)?;
+            self.capture_dropped = capture.dropped();
+            self.capture_errors = capture.errors();
+            self.playout_underruns = playout.underruns();
+            let mut input = Box::new(Input {
+                unit: self.unit,
+                capture,
+            });
+            let mut playout = Box::new(playout);
+
+            let input_callback = AURenderCallbackStruct {
+                input_proc: Some(input_callback),
+                input_proc_ref_con: (&mut *input as *mut Input).cast(),
+            };
+            let render_callback = AURenderCallbackStruct {
+                input_proc: Some(render_callback),
+                input_proc_ref_con: (&mut *playout as *mut Playout).cast(),
+            };
+            self.set(
+                K_AUDIO_OUTPUT_UNIT_PROPERTY_SET_INPUT_CALLBACK,
+                K_AUDIO_UNIT_SCOPE_GLOBAL,
+                INPUT_BUS,
+                &input_callback,
+            )?;
+            self.set(
+                K_AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK,
+                K_AUDIO_UNIT_SCOPE_INPUT,
+                OUTPUT_BUS,
+                &render_callback,
+            )?;
+
+            // From here the unit may call back, so the state is kept until it is stopped.
+            self.running = Some(Running {
+                _input: input,
+                _playout: playout,
+            });
+            // SAFETY: an initialised unit whose callbacks point at the boxes in `running`.
+            check(
+                unsafe { AudioOutputUnitStart(self.unit) },
+                "AudioOutputUnitStart",
+            )
+        }
+    }
+
+    impl AudioBackend for VoiceProcessingBackend {
+        /// Starts the unit. The app calls it once the audio session is active: with CallKit,
+        /// from `provider(_:didActivate:)`.
+        fn start(&mut self, io: DeviceIo) -> Result<(), AudioError> {
+            self.stop()?;
+            self.configure()?;
+            // SAFETY: a configured unit that is not initialised.
+            check(
+                unsafe { AudioUnitInitialize(self.unit) },
+                "AudioUnitInitialize",
+            )?;
+            let started = self.start_initialized(io);
+            if started.is_err() {
+                // Leaves the unit uninitialised, and frees the state if it got that far.
+                let _ = self.stop();
+                // SAFETY: undoes the `AudioUnitInitialize` above; harmless if `stop` did.
+                unsafe { AudioUnitUninitialize(self.unit) };
+            }
+            started
+        }
+
+        /// Stops and uninitialises the unit, then frees the callback state: nothing is freed
+        /// on the audio thread. The app calls it on CallKit's `didDeactivate` or when the call
+        /// ends.
+        fn stop(&mut self) -> Result<(), AudioError> {
+            let Some(running) = self.running.take() else {
+                return Ok(());
+            };
+            // SAFETY: the unit is alive; stopping and uninitialising are valid in any state.
+            let stopped = check(
+                unsafe { AudioOutputUnitStop(self.unit) },
+                "AudioOutputUnitStop",
+            );
+            // SAFETY: as above.
+            let uninitialised = check(
+                unsafe { AudioUnitUninitialize(self.unit) },
+                "AudioUnitUninitialize",
+            );
+            if stopped.is_err() {
+                // The unit may still call back: keep the state until `drop` disposes the unit.
+                self.running = Some(running);
+            }
+            stopped.and(uninitialised)
+        }
+    }
+
+    impl Drop for VoiceProcessingBackend {
+        fn drop(&mut self) {
+            let _ = self.stop();
+            // SAFETY: the unit came from `AudioComponentInstanceNew` and is disposed once, here.
+            // Once disposed it never calls back, so the state still in `running` after a failed
+            // stop is freed safely when the fields drop, after this.
+            unsafe { AudioComponentInstanceDispose(self.unit) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::FRAME_SAMPLES;
+        use crate::audio::audio_io;
+        use std::ffi::c_char;
+        use std::time::Duration;
+
+        type Id = *mut c_void;
+
+        #[link(name = "objc")]
+        unsafe extern "C" {
+            fn objc_getClass(name: *const c_char) -> Id;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+
+        #[link(name = "AVFAudio", kind = "framework")]
+        unsafe extern "C" {
+            static AVAudioSessionCategoryPlayAndRecord: Id;
+            static AVAudioSessionModeVoiceChat: Id;
+        }
+
+        /// Stands in for the app's Swift side, which the library leaves the session to:
+        /// `playAndRecord` + `voiceChat`, active. Without it the unit initialises but will not
+        /// start (OSStatus -66637).
+        fn activate_voice_chat_session() {
+            type SharedInstance = unsafe extern "C" fn(Id, *mut c_void) -> Id;
+            type SetCategory =
+                unsafe extern "C" fn(Id, *mut c_void, Id, Id, usize, *mut Id) -> bool;
+            type SetActive = unsafe extern "C" fn(Id, *mut c_void, bool, *mut Id) -> bool;
+            // SAFETY: each `objc_msgSend` is cast to the exact signature of the method it
+            // sends, as arm64 requires; the class, selectors and constants exist on iOS 15+.
+            unsafe {
+                let send = objc_msgSend as *const ();
+                let class = objc_getClass(c"AVAudioSession".as_ptr());
+                let shared: SharedInstance = std::mem::transmute(send);
+                let session = shared(class, sel_registerName(c"sharedInstance".as_ptr()));
+                assert!(!session.is_null());
+                let set_category: SetCategory = std::mem::transmute(send);
+                let mut error: Id = std::ptr::null_mut();
+                assert!(set_category(
+                    session,
+                    sel_registerName(c"setCategory:mode:options:error:".as_ptr()),
+                    AVAudioSessionCategoryPlayAndRecord,
+                    AVAudioSessionModeVoiceChat,
+                    0,
+                    &mut error,
+                ));
+                let set_active: SetActive = std::mem::transmute(send);
+                assert!(set_active(
+                    session,
+                    sel_registerName(c"setActive:error:".as_ptr()),
+                    true,
+                    &mut error,
+                ));
+            }
+        }
+
+        #[test]
+        fn the_backend_can_move_to_another_thread() {
+            fn assert_send<T: Send>() {}
+            assert_send::<VoiceProcessingBackend>();
+        }
+
+        // Needs the real unit: run in the iOS simulator (see CLAUDE.md), which captures from
+        // the Mac's microphone.
+        #[test]
+        #[ignore]
+        fn the_unit_captures_and_plays_until_stopped() {
+            let (device, mut engine) = audio_io(64);
+            let queued = engine.playout.frames_free();
+            for _ in 0..10 {
+                assert!(engine.playout.write_frame(&[0; FRAME_SAMPLES]));
+            }
+            activate_voice_chat_session();
+            let mut backend = VoiceProcessingBackend::new().unwrap();
+            backend.start(device).unwrap();
+            std::thread::sleep(Duration::from_millis(1000));
+            backend.stop().unwrap();
+            backend.stop().unwrap();
+
+            let mut frames = 0;
+            let mut frame = [0; FRAME_SAMPLES];
+            while engine.capture.read_frame(&mut frame) {
+                frames += 1;
+            }
+            // About 50 frames in a second; the unit takes a moment to start.
+            assert!(frames >= 10, "captured {frames} frames");
+            assert_eq!(
+                engine.playout.frames_free(),
+                queued,
+                "playout was not drained"
+            );
+            assert!(backend.playout_underruns().get() > 0);
+            assert_eq!(backend.capture_errors().get(), 0);
+        }
+
+        #[test]
+        #[ignore]
+        fn the_unit_starts_again_after_a_stop() {
+            activate_voice_chat_session();
+            let mut backend = VoiceProcessingBackend::new().unwrap();
+            for _ in 0..2 {
+                let (device, mut engine) = audio_io(64);
+                backend.start(device).unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+                backend.stop().unwrap();
+                let mut frame = [0; FRAME_SAMPLES];
+                assert!(engine.capture.read_frame(&mut frame));
+            }
+        }
+    }
+}
+
 /// Turns the result of the Core Audio function `call` into a `Result`.
 pub(crate) fn check(status: OSStatus, call: &'static str) -> Result<(), AudioError> {
     if status == 0 {
@@ -397,6 +938,8 @@ mod tests {
         assert_eq!(size_of::<AudioStreamBasicDescription>(), 40);
         assert_eq!(size_of::<AudioBuffer>(), 16);
         assert_eq!(size_of::<AudioBufferList>(), 24);
+        assert_eq!(size_of::<AudioComponentDescription>(), 20);
+        assert_eq!(size_of::<AURenderCallbackStruct>(), 16);
     }
 
     #[test]
