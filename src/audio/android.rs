@@ -61,6 +61,20 @@ fn granted_format(
     Ok((format, kind))
 }
 
+/// The playout buffer to ask for: two bursts, AAudio's advice for low latency without glitches,
+/// within the stream's capacity. `None` leaves AAudio's default.
+fn playout_buffer_frames(frames_per_burst: i32, capacity: i32) -> Option<i32> {
+    if frames_per_burst <= 0 {
+        return None;
+    }
+    let wanted = frames_per_burst.saturating_mul(2);
+    Some(if capacity > 0 {
+        wanted.min(capacity)
+    } else {
+        wanted
+    })
+}
+
 /// What a stream's data callback does with each buffer, in the format the stream opened with.
 enum Processor {
     Capture {
@@ -338,6 +352,23 @@ mod tests {
             CALLBACK_RESULT_CONTINUE
         );
         assert_eq!(buffer, [7, 7]);
+    }
+
+    #[test]
+    fn the_playout_buffer_holds_two_bursts() {
+        assert_eq!(playout_buffer_frames(192, 4096), Some(384));
+    }
+
+    #[test]
+    fn the_playout_buffer_never_asks_for_more_than_the_capacity() {
+        assert_eq!(playout_buffer_frames(192, 300), Some(300));
+    }
+
+    #[test]
+    fn without_a_burst_size_the_default_buffer_stays() {
+        assert_eq!(playout_buffer_frames(0, 4096), None);
+        assert_eq!(playout_buffer_frames(-1, 4096), None);
+        assert_eq!(playout_buffer_frames(i32::MAX, i32::MAX), Some(i32::MAX));
     }
 
     #[test]
