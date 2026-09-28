@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval};
 
@@ -26,6 +26,7 @@ pub use uplink::{SendStats, Uplink};
 use crate::audio::EngineIo;
 use crate::codec;
 use crate::rtp::{AudioPacket, AudioReceiver, AudioSender, RtpError};
+use webrtc::media_stream::track_remote::TrackRemote;
 
 /// Where our Opus packets go: one call per 20 ms frame.
 pub trait PacketSink: Send + 'static {
@@ -51,6 +52,44 @@ impl PacketSource for AudioReceiver {
     type Error = RtpError;
     fn recv(&mut self) -> impl Future<Output = Result<Option<AudioPacket>, RtpError>> + Send {
         self.recv_packet()
+    }
+}
+
+/// The other side's audio before its track exists. webrtc-rs announces a remote track
+/// (`on_track`) only when its first RTP packet arrives, after the call has started sending; so
+/// the call starts with this, and the first `recv` waits for the track that `on_track` hands
+/// over through `track`.
+pub struct RemoteAudio {
+    track: Option<oneshot::Receiver<Arc<dyn TrackRemote>>>,
+    receiver: Option<AudioReceiver>,
+}
+
+impl RemoteAudio {
+    pub fn new(track: oneshot::Receiver<Arc<dyn TrackRemote>>) -> Self {
+        Self {
+            track: Some(track),
+            receiver: None,
+        }
+    }
+}
+
+impl PacketSource for RemoteAudio {
+    type Error = RtpError;
+    async fn recv(&mut self) -> Result<Option<AudioPacket>, RtpError> {
+        if self.receiver.is_none() {
+            let Some(pending) = self.track.take() else {
+                return Ok(None);
+            };
+            match pending.await {
+                Ok(track) => self.receiver = Some(AudioReceiver::new(track)),
+                // Whoever would have handed the track over is gone: no audio will come.
+                Err(_) => return Ok(None),
+            }
+        }
+        match &self.receiver {
+            Some(receiver) => receiver.recv_packet().await,
+            None => Ok(None),
+        }
     }
 }
 
@@ -465,6 +504,16 @@ mod tests {
         let stats = call.stop().await;
         assert!(stats.send_errors >= 20, "{stats:?}");
         assert_eq!(stats.sent, 0);
+    }
+
+    // A call that ends before the other side ever sent audio: there will be no track.
+    #[tokio::test(start_paused = true)]
+    async fn remote_audio_ends_when_the_track_never_comes() {
+        let (track, pending) = oneshot::channel();
+        let mut remote = RemoteAudio::new(pending);
+        drop(track);
+        let received = tokio::time::timeout(Duration::from_secs(1), remote.recv()).await;
+        assert!(matches!(received, Ok(Ok(None))));
     }
 
     #[test]

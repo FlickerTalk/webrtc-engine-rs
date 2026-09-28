@@ -1,20 +1,27 @@
 //! Two in-process peers on loopback, host candidates only, no STUN: a call's Opus packets cross
 //! real RTP tracks in order. The offer and answer are handed over directly.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodecParameters, RtpCodecKind};
-use tokio::sync::{mpsc, watch};
-use tokio::time::timeout;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{MissedTickBehavior, timeout};
 use webrtc::media_stream::track_remote::TrackRemote;
 use webrtc::peer_connection::{
     MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
     RTCIceGatheringState, RTCPeerConnectionState,
 };
+use webrtc_engine::FRAME_SAMPLES;
+use webrtc_engine::audio::{DeviceIo, audio_io};
+use webrtc_engine::call::{Call, CallConfig, CallStats, RemoteAudio};
 use webrtc_engine::rtp::{
     AudioReceiver, AudioSender, add_audio_track, opus_codec, peer_connection_builder,
 };
+
+use common::{align_windows, mean_correlation, test_signal};
 
 /// Each wait gets this long; the whole call gets `CALL_LIMIT`, so the test can never hang.
 const STEP_LIMIT: Duration = Duration::from_secs(10);
@@ -242,4 +249,102 @@ async fn answering_an_offer_that_numbers_opus_differently_still_carries_audio() 
         .expect("opus is registered as 109");
     let caller = peer_with(PeerConnectionBuilder::new().with_media_engine(engine)).await;
     call(caller, peer().await).await;
+}
+
+const VOICE_SECONDS: usize = 3;
+
+/// The test voice, or its mirror image for the other side: hearing one's own voice instead of
+/// the other side's would then correlate negatively.
+fn voice(inverted: bool) -> Vec<i16> {
+    let voice = test_signal(VOICE_SECONDS * 48_000);
+    if inverted {
+        voice.into_iter().map(|s| s.saturating_neg()).collect()
+    } else {
+        voice
+    }
+}
+
+/// A device in real time: every 10 ms it captures 10 ms of `voice` and plays 10 ms.
+/// Returns what it played.
+async fn talk(mut device: DeviceIo, voice: Vec<i16>) -> Vec<i16> {
+    const CHUNK: usize = FRAME_SAMPLES / 2;
+    let mut ticker = tokio::time::interval(Duration::from_millis(10));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
+    let mut played = Vec::with_capacity(voice.len());
+    for chunk in voice.chunks(CHUNK) {
+        ticker.tick().await;
+        device.capture.push(chunk);
+        let mut out = [0i16; CHUNK];
+        device.playout.pop(&mut out);
+        played.extend_from_slice(&out);
+    }
+    played
+}
+
+/// Starts the whole pipeline on one side: its microphone ring goes out through `sender`, and
+/// the other side's track, once `on_track` hands it over, plays into its speaker ring.
+fn start_call(
+    sender: AudioSender,
+    mut tracks: mpsc::UnboundedReceiver<Arc<dyn TrackRemote>>,
+) -> (Call, DeviceIo) {
+    let (device, engine) = audio_io(16);
+    let (track, pending) = oneshot::channel();
+    tokio::spawn(async move {
+        if let Some(remote) = tracks.recv().await {
+            let _ = track.send(remote);
+        }
+    });
+    let call = Call::start(
+        engine,
+        sender,
+        RemoteAudio::new(pending),
+        CallConfig::default(),
+    )
+    .expect("the call starts");
+    (call, device)
+}
+
+fn assert_heard(name: &str, played: &[i16], other_voice: &[i16], stats: &CallStats) {
+    // From the second second on, in quarter-second windows.
+    let alignments = align_windows(other_voice, played, 48_000, 12_000, 6, 24_000);
+    let mean = mean_correlation(&alignments);
+    eprintln!("{name}: mean correlation {mean:.3}, {alignments:?}\n  {stats:?}");
+    assert!(mean > 0.7, "{name}: mean correlation {mean}");
+    assert!(stats.receive.decoded > 100, "{name}: {stats:?}");
+    assert_eq!(stats.send_errors, 0, "{name}: {stats:?}");
+}
+
+// The whole pipeline on both sides of a real webrtc-rs call: microphone ring, Opus, RTP over
+// loopback, jitter buffer, Opus, speaker ring.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voice_crosses_a_loopback_call_through_the_whole_pipeline() {
+    timeout(CALL_LIMIT, async {
+        let caller = peer().await;
+        let callee = peer().await;
+        connect(&caller, &callee).await;
+        let (caller_call, caller_device) = start_call(caller.sender, caller.tracks);
+        let (callee_call, callee_device) = start_call(callee.sender, callee.tracks);
+
+        let (caller_heard, callee_heard) = tokio::join!(
+            talk(caller_device, voice(false)),
+            talk(callee_device, voice(true))
+        );
+        let caller_stats = caller_call.stop().await;
+        let callee_stats = callee_call.stop().await;
+        caller
+            .connection
+            .close()
+            .await
+            .expect("the caller hangs up");
+        callee
+            .connection
+            .close()
+            .await
+            .expect("the callee hangs up");
+
+        assert_heard("callee", &callee_heard, &voice(false), &callee_stats);
+        assert_heard("caller", &caller_heard, &voice(true), &caller_stats);
+    })
+    .await
+    .expect("the call finishes within the limit");
 }
