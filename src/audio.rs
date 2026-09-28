@@ -3,10 +3,18 @@
 //! The engine works in one format only: 48 kHz, mono, i16 PCM, frames of 20 ms.
 
 pub mod format;
+pub mod frames;
 pub mod resample;
 pub mod ring;
 
 use std::fmt;
+
+/// The engine's sample rate.
+pub const SAMPLE_RATE: u32 = 48_000;
+/// Samples in one 20 ms frame at [`SAMPLE_RATE`], mono.
+pub const FRAME_SAMPLES: usize = 960;
+/// One 20 ms frame of 48 kHz mono i16 PCM.
+pub type Frame = [i16; FRAME_SAMPLES];
 
 /// Why audio could not be set up. Never raised from inside an audio callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
