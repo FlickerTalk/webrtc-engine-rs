@@ -243,6 +243,14 @@ impl SoftwareEncoder {
             rotation: Rotation::Deg0,
         }))
     }
+
+    /// Makes the next encoded frame a keyframe, with its SPS and PPS.
+    pub fn force_keyframe(&mut self) {
+        // Without an encoder yet the next frame is the first, a keyframe anyway.
+        if let Some(sized) = &mut self.encoder {
+            sized.encoder.force_intra_frame();
+        }
+    }
 }
 
 impl YUVSource for I420Frame {
@@ -367,6 +375,31 @@ mod tests {
             assert!(!next.keyframe);
             assert_eq!(nal_types(&next.data), [1], "a delta frame is one slice");
         }
+    }
+
+    #[test]
+    fn a_forced_keyframe_carries_sps_and_pps_again() {
+        let mut encoder = encoder();
+        for index in 0..5 {
+            encoder
+                .encode(&moving_pattern(320, 240, index), at(index))
+                .unwrap();
+        }
+        encoder.force_keyframe();
+        let forced = encoder
+            .encode(&moving_pattern(320, 240, 5), at(5))
+            .unwrap()
+            .unwrap();
+        assert!(forced.keyframe);
+        let types = nal_types(&forced.data);
+        assert_eq!(types[..2], [7, 8], "SPS and PPS first: {types:?}");
+        assert!(types.contains(&5));
+
+        let after = encoder
+            .encode(&moving_pattern(320, 240, 6), at(6))
+            .unwrap()
+            .unwrap();
+        assert!(!after.keyframe, "only one frame is forced");
     }
 
     fn flat_rgb(width: u32, height: u32, colour: [u8; 3]) -> Vec<u8> {
