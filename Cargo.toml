@@ -12,3 +12,8 @@ cpal = { version = "0.18", optional = true }
 [features]
 # The desktop backend (cpal), for trying the engine on a computer. Mobile builds leave it out.
 desktop = ["dep:cpal"]
+
+[[example]]
+name = "mic_echo"
+required-features = ["desktop"]
+test = true
