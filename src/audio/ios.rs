@@ -860,6 +860,14 @@ mod unit {
             assert_send::<VoiceProcessingBackend>();
         }
 
+        // Creates the unit without starting it: no session or microphone needed.
+        #[test]
+        fn the_platform_backend_loads_on_ios() {
+            let mut backend = crate::audio::platform_backend().unwrap();
+            assert_eq!(backend.maintain(), Ok(()));
+            assert_eq!(backend.stop(), Ok(()));
+        }
+
         // Needs the real unit: run in the iOS simulator (see CLAUDE.md), which captures from
         // the Mac's microphone.
         #[test]
