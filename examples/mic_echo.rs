@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use webrtc_engine::FRAME_SAMPLES;
 use webrtc_engine::audio::desktop::DesktopBackend;
-use webrtc_engine::audio::{AudioBackend, FRAME_SAMPLES, audio_io};
+use webrtc_engine::audio::{AudioBackend, audio_io};
 
 const DELAY: Duration = Duration::from_millis(200);
 /// Room for the delay plus plenty of slack for scheduling and for the two devices' clocks.

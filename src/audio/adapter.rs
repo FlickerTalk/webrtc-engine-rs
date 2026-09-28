@@ -157,7 +157,7 @@ impl PlayoutAdapter {
 mod tests {
     use super::*;
     use crate::audio::ring::ring;
-    use crate::audio::{FRAME_SAMPLES, SAMPLE_RATE};
+    use crate::{FRAME_SAMPLES, SAMPLE_RATE};
     use std::f32::consts::TAU;
 
     const ENGINE_MONO: StreamFormat = StreamFormat {

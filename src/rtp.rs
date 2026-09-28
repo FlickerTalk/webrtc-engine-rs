@@ -5,7 +5,7 @@
 use std::fmt;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use rtc::media::Sample;
@@ -23,6 +23,8 @@ use webrtc::peer_connection::{
     MediaEngine, PeerConnection, PeerConnectionBuilder, Registry, configure_rtcp_reports,
 };
 use webrtc::rtp_transceiver::RtpSender;
+
+use crate::FRAME_DURATION;
 
 /// What can go wrong between Opus packets and the tracks.
 #[derive(Debug)]
@@ -98,9 +100,6 @@ pub fn peer_connection_builder<A: ToSocketAddrs>() -> Result<PeerConnectionBuild
         .with_media_engine(media_engine()?)
         .with_interceptor_registry(configure_rtcp_reports(Registry::new())))
 }
-
-/// One Opus packet carries 20 ms of audio: 960 samples at 48 kHz.
-pub const FRAME_DURATION: Duration = Duration::from_millis(20);
 
 // Fixed, not random: they only name the track inside a one-to-one call, and the description
 // that carries them travels encrypted.

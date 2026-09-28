@@ -157,7 +157,8 @@ impl AudioBackend for DesktopBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::{FRAME_SAMPLES, SAMPLE_RATE, audio_io};
+    use crate::audio::audio_io;
+    use crate::{FRAME_SAMPLES, SAMPLE_RATE};
     use cpal::SupportedBufferSize;
 
     fn range(

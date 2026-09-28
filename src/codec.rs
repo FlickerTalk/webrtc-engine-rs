@@ -4,10 +4,8 @@ use std::ffi::c_int;
 use std::fmt;
 use std::ptr::NonNull;
 
-/// Sample rate of every frame, in Hz.
-pub const SAMPLE_RATE: u32 = 48_000;
-/// Samples in one 20 ms mono frame at 48 kHz.
-pub const FRAME_SAMPLES: usize = 960;
+use crate::{FRAME_SAMPLES, SAMPLE_RATE};
+
 /// Target bitrate: what WebRTC uses for mono Opus voice; in-band FEC is paid from it.
 pub const BITRATE: i32 = 32_000;
 /// Packet loss the encoder plans its FEC for, in percent.
