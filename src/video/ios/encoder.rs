@@ -386,6 +386,7 @@ impl H264Encoder {
     }
 
     /// Waits until every queued frame has been delivered.
+    #[cfg(test)]
     pub(crate) fn flush(&mut self) -> Result<(), VideoError> {
         // SAFETY: a live session; an invalid time completes every pending frame.
         check(

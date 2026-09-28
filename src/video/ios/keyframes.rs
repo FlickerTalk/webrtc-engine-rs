@@ -108,6 +108,7 @@ impl DecodeGate {
     }
 
     /// Whether it is waiting for a keyframe.
+    #[cfg(test)]
     pub(crate) fn waiting(&self) -> bool {
         self.waiting
     }
