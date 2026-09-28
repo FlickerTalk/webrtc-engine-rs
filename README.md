@@ -29,6 +29,7 @@ backend (AAudio, `VOICE_COMMUNICATION`) and the integration into the FlickerTalk
 | `jitter` | Reorders packets and hands out one frame per 20 ms; adaptive depth from 1 to 10 frames. |
 | `call`   | The pipeline. `Uplink` (capture → Opus packets), `Downlink` (packets → jitter buffer → decode, FEC or PLC → playout, paced by the speaker) and `Call`, which runs both on Tokio tasks with mute, stop and counters. |
 | `netsim` | A deterministic simulated network (delay, jitter, loss, reordering, duplication, seeded) and a simulated link usable as a call's transport. |
+| `video`  | The video contract (work in progress): platform code captures and hardware-encodes, and decodes and renders; the core only moves H.264 access units (`EncodedFrame`) through `VideoSource`, `VideoSink` and a bounded frame channel. |
 
 Every module works in one format, defined at the crate root: `SAMPLE_RATE` (48 kHz),
 `FRAME_SAMPLES` (960), `FRAME_DURATION` (20 ms) and `Frame`.
