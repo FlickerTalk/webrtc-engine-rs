@@ -7,6 +7,7 @@ use std::time::Duration;
 pub mod audio;
 pub mod codec;
 pub mod jitter;
+pub mod netsim;
 pub mod rtp;
 
 /// The engine's sample rate, in Hz: Opus' native rate, so nothing is resampled between the
