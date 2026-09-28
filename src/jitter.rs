@@ -27,7 +27,8 @@ pub struct Stats {
     pub late: u64,
     /// Packets dropped because the same sequence was already buffered.
     pub duplicate: u64,
-    /// Packets received but thrown away unplayed: flushed by a resync, or a stray far packet.
+    /// Packets received but thrown away unplayed: over capacity, flushed by a resync, or a stray
+    /// far packet.
     pub discarded: u64,
     /// Packets stored now.
     pub depth: usize,
@@ -41,6 +42,10 @@ const INITIAL_TARGET: usize = 2;
 /// A sequence this far from the highest one (1 s of audio) is not reordering but a restart
 /// or a long outage.
 const MAX_JUMP: i64 = 50;
+
+/// Most packets kept (1 s of audio): far above the 10-frame maximum depth, so it only bites
+/// when nobody drains the buffer.
+const CAPACITY: usize = 50;
 
 pub struct JitterBuffer {
     /// Keyed by extended sequence, so the order survives the 16-bit wrap.
@@ -105,6 +110,13 @@ impl JitterBuffer {
             return;
         }
         self.packets.insert(extended, payload);
+        if self.packets.len() > CAPACITY
+            && let Some((oldest, _)) = self.packets.pop_first()
+        {
+            self.counts.discarded += 1;
+            // Its turn is gone: a copy arriving later is late, not a hole to conceal.
+            self.next = self.next.map(|next| next.max(oldest + 1));
+        }
     }
 
     /// Starts over from the next packet: what is buffered belongs to the old stream.
@@ -344,5 +356,23 @@ mod tests {
         assert_eq!(buffer.playout(), Playout::Frame(vec![3]));
         assert_eq!(buffer.playout(), Playout::Waiting);
         assert_eq!(buffer.stats().discarded, 1);
+    }
+
+    // Memory is bounded: when full, the oldest packet goes, and playout moves on to what is
+    // left instead of concealing the dropped ones.
+    #[test]
+    fn keeps_at_most_capacity_packets() {
+        let mut buffer = JitterBuffer::new();
+        buffer.push(1, vec![1]);
+        buffer.push(2, vec![2]);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![1]));
+        for sequence in 3..=60 {
+            buffer.push(sequence, vec![sequence as u8]);
+        }
+        let stats = buffer.stats();
+        assert_eq!(stats.depth, CAPACITY);
+        assert_eq!(stats.discarded, 9);
+        assert_eq!(buffer.playout(), Playout::Frame(vec![11]));
+        assert_eq!(buffer.stats().concealed, 0);
     }
 }
