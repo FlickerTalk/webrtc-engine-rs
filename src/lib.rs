@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 pub mod audio;
+pub mod call;
 pub mod codec;
 pub mod jitter;
 pub mod netsim;
