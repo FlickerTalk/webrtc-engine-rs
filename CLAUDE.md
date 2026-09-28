@@ -18,7 +18,7 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 
 | Módulo   | Qué hace |
 | -------- | -------- |
-| `audio`  | Anillos SPSC sin bloqueos ni asignaciones entre los callbacks del dispositivo y el motor; adaptadores (mezcla a mono, remuestreo lineal, i16/f32, silencio y cuenta de vacíos); trait `AudioBackend`; `audio::desktop` con cpal (feature `desktop`, desactivada por defecto). |
+| `audio`  | Anillos SPSC sin bloqueos ni asignaciones entre los callbacks del dispositivo y el motor; adaptadores (mezcla a mono, remuestreo lineal, i16/f32, silencio y cuenta de vacíos); trait `AudioBackend`; `audio::desktop` con cpal (feature `desktop`, desactivada por defecto); `audio::ios` con `VoiceProcessingBackend` (solo iOS). |
 | `codec`  | Opus con libopus 1.6.1 vendorizada en `vendor/opus` y compilada con `cc` (`build.rs`, sin cmake). VoIP, 32 kbit/s, FEC en banda, 10 % de pérdida esperada, DTX apagado. `decode`, `conceal` (PLC), `recover` (FEC del paquete siguiente). |
 | `rtp`    | Opus sobre pistas de webrtc-rs 0.21 (API sans-IO + crate `rtc`): `media_engine`, `peer_connection_builder`, `add_audio_track` → `AudioSender`, `AudioReceiver`. El payload type negociado se lee en cada envío. |
 | `jitter` | `JitterBuffer`: reordena por secuencia (con el salto de 65535 a 0), profundidad adaptativa de 1 a 10 tramas según el jitter RFC 3550 medido con `push_at`; `playout()` → `Frame` / `Missing` / `Waiting`; `peek_next` para la FEC. |
@@ -50,6 +50,43 @@ PacketSource → Downlink: JitterBuffer → Opus (decode / FEC / PLC) → Playou
 - **`RemoteAudio`**: webrtc-rs anuncia la pista remota (`on_track`) al llegar su primer paquete
   RTP, o sea, después de empezar a enviar. La llamada arranca con `RemoteAudio` y su primer
   `recv` espera la pista por un `oneshot`.
+
+### Backend iOS (`audio::ios`)
+
+`VoiceProcessingBackend` (solo `target_os = "ios"`, `Send`): `new() -> Result<Self, AudioError>`
+crea la unidad `VoiceProcessingIO` (cancelación de eco, supresión de ruido y control de ganancia
+del sistema), `start(DeviceIo)` la configura, la inicializa y la arranca, `stop()` la para.
+Micrófono en el bus 1 (entrada habilitada), altavoz/auricular en el bus 0. Contadores:
+`capture_dropped`, `playout_underruns`, `capture_errors`.
+
+- **Contrato con Swift y CallKit** (también en la doc del módulo): **Rust nunca configura ni
+  activa `AVAudioSession`.**
+  1. El Swift de la app pone la categoría `.playAndRecord` y el modo `.voiceChat` antes de
+     reportar o contestar la llamada; no llama a `setActive(true)`: lo activa CallKit.
+  2. En `provider(_:didActivate:)` la app llama a `start`. Antes no: sin sesión activa que pueda
+     grabar, la unidad se inicializa pero no arranca (OSStatus -66637, visto en el simulador).
+  3. En `provider(_:didDeactivate:)` y al colgar, `stop`. Tras una interrupción, cuando CallKit
+     vuelve a activar la sesión: `stop` y `start` otra vez.
+  4. `Info.plist`: `NSMicrophoneUsageDescription` y los modos de fondo `audio` y `voip`. Una sola
+     unidad de voz por proceso: el WebView no debe tener el micrófono durante una llamada nativa.
+  5. Las rutas (altavoz, auricular, Bluetooth) son cosa de la sesión; la unidad las sigue.
+- **Formatos**: pide 48 kHz mono i16 a los dos lados (el formato del motor, copia exacta); si la
+  unidad no lo acepta, f32. Tras `AudioUnitInitialize` relee lo que da de verdad y se lo pasa a
+  `CaptureAdapter`/`PlayoutAdapter`. En el simulador da 48 kHz mono i16.
+- **Tiempo real**: los callbacks no bloquean, no reservan memoria ni hacen llamadas al sistema
+  salvo `AudioUnitRender`. El búfer del micrófono se reserva al arrancar para el máximo de
+  frames por callback, que se sube a 4096 (lo que usa iOS con la pantalla bloqueada). Los fallos
+  en el callback se cuentan, no se propagan.
+- **Parada**: `stop` para y desinicializa la unidad y **después** suelta el estado de los
+  callbacks; si `AudioOutputUnitStop` falla, el estado se queda hasta que `Drop` destruye la
+  unidad (`AudioComponentInstanceDispose`), así nunca se libera nada con el hilo de audio vivo.
+- **FFI a mano**: una docena de declaraciones de AudioToolbox copiadas de las cabeceras del SDK,
+  con tests que fijan el tamaño de cada struct. `coreaudio-sys` pediría bindgen y libclang al
+  compilar; `objc2-audio-toolbox`, una familia de crates generados. Ninguna dependencia nueva.
+- **Pruebas**: el formato, la traducción de `OSStatus` y el manejo de búferes de los dos
+  callbacks son funciones puras que se prueban en el host (`cfg(any(target_os = "ios", test))`).
+  Lo que necesita la unidad real son tests `#[ignore]` para el simulador; hacen de lado Swift y
+  activan la sesión con el runtime de Objective-C (solo en los tests).
 
 ## Decisiones y por qué
 
@@ -84,6 +121,16 @@ cargo run --example mic_echo --features desktop    # solo dispositivos, 200 ms d
 
 # iOS
 IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --target aarch64-apple-ios
+IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --target aarch64-apple-ios-sim
+IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo clippy --all-targets --target aarch64-apple-ios -- -D warnings
+
+# Tests en el simulador de iOS (con uno arrancado: xcrun simctl list devices booted). El binario
+# se lanza con simctl spawn, sin instalar ninguna app; los #[ignore] usan la unidad de voz real
+# con el micrófono del Mac.
+IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo test --target aarch64-apple-ios-sim --no-run
+xcrun simctl spawn booted target/aarch64-apple-ios-sim/debug/deps/webrtc_engine-<hash>
+xcrun simctl spawn booted target/aarch64-apple-ios-sim/debug/deps/webrtc_engine-<hash> \
+  --ignored --test-threads 1 audio::ios
 
 # Android
 NDK_BIN=~/Library/Android/sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/darwin-x86_64/bin
@@ -120,7 +167,8 @@ ALSA). Sin secretos.
 
 ## Pendiente
 
-- **Backend iOS**: VoiceProcessingIO (cancelación de eco) y la sesión de audio de CallKit.
+- **Backend iOS en la app**: el lado Swift (sesión de audio, CallKit, reinicio tras una
+  interrupción con anillos nuevos) y probarlo en el iPhone con la pantalla bloqueada.
 - **Backend Android**: AAudio con `VOICE_COMMUNICATION` (y el AEC de la plataforma).
 - **Integración en la app de FlickerTalk** (`app/`): sustituir el audio del WebView en las
   llamadas; señalización y ciclo de vida de la llamada.
@@ -134,6 +182,12 @@ ALSA). Sin secretos.
 - Paquetes de otras duraciones (10, 40, 60 ms): hoy se tratan como error y se ocultan.
 
 ## Estado (2026-09-28)
+
+**Backend iOS** (rama `ios-backend`): `audio::ios::VoiceProcessingBackend` sobre
+`VoiceProcessingIO`, con FFI a mano. 23 tests en el host; en el simulador de iOS pasan todos los
+tests del crate y los dos `#[ignore]` de la unidad real (arranca, captura ~50 tramas por segundo,
+vacía la cola del altavoz, para y vuelve a arrancar). Sin probar aún en un iPhone.
+
 
 Fusionadas en `engine` las cuatro ramas revisadas (`jitter`, `codec`, `rtp`, `audio`), con las
 constantes unificadas en la raíz del crate y `Cargo.lock` versionado. Hecho encima:
