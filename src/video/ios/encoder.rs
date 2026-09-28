@@ -69,7 +69,7 @@ impl EncoderOutput {
         self.sender.keyframe_needed()
     }
 
-    fn count_error(&self) {
+    pub(crate) fn count_error(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
