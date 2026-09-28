@@ -82,7 +82,10 @@ mod tests {
     /// Frequency from the upward zero crossings, skipping the start-up of the resampler.
     fn frequency_of(signal: &[f32], rate: u32) -> f32 {
         let body = &signal[100..];
-        let crossings = body.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        let crossings = body
+            .windows(2)
+            .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
+            .count();
         crossings as f32 * rate as f32 / body.len() as f32
     }
 

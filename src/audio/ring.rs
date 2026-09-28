@@ -66,7 +66,9 @@ impl RingProducer {
             let slot = write.wrapping_add(offset) & shared.mask;
             shared.slots[slot].store(sample, Ordering::Relaxed);
         }
-        shared.write.store(write.wrapping_add(count), Ordering::Release);
+        shared
+            .write
+            .store(write.wrapping_add(count), Ordering::Release);
         count
     }
 
@@ -92,7 +94,9 @@ impl RingConsumer {
             let slot = read.wrapping_add(offset) & shared.mask;
             *sample = shared.slots[slot].load(Ordering::Relaxed);
         }
-        shared.read.store(read.wrapping_add(count), Ordering::Release);
+        shared
+            .read
+            .store(read.wrapping_add(count), Ordering::Release);
         count
     }
 

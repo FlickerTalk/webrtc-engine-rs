@@ -32,6 +32,13 @@ impl Sample for f32 {
     }
 }
 
+/// The layout of a device stream: interleaved samples at some rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFormat {
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

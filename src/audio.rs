@@ -2,6 +2,7 @@
 //!
 //! The engine works in one format only: 48 kHz, mono, i16 PCM, frames of 20 ms.
 
+pub mod adapter;
 pub mod format;
 pub mod frames;
 pub mod resample;
@@ -33,7 +34,10 @@ impl fmt::Display for AudioError {
             Self::InvalidFormat {
                 sample_rate,
                 channels,
-            } => write!(f, "invalid audio format: {sample_rate} Hz, {channels} channels"),
+            } => write!(
+                f,
+                "invalid audio format: {sample_rate} Hz, {channels} channels"
+            ),
             Self::NoDevice => write!(f, "no audio device"),
             Self::Backend(reason) => write!(f, "audio backend: {reason}"),
         }
