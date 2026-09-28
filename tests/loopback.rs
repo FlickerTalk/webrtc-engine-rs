@@ -1,5 +1,5 @@
-//! Two in-process peers on loopback, host candidates only, no STUN: a call's Opus packets cross
-//! real RTP tracks in order. The offer and answer are handed over directly.
+//! Two in-process peers on loopback, host candidates only, no STUN: a call's Opus packets and
+//! H.264 frames cross real RTP tracks in order. The offer and answer are handed over directly.
 
 mod common;
 
@@ -20,6 +20,10 @@ use webrtc_engine::call::{Call, CallConfig, CallStats, RemoteAudio};
 use webrtc_engine::rtp::{
     AudioReceiver, AudioSender, add_audio_track, opus_codec, peer_connection_builder,
 };
+use webrtc_engine::video::call::{VideoCall, VideoCallConfig, VideoTransport};
+use webrtc_engine::video::fake::{FakeSink, FakeSource, frame_index};
+use webrtc_engine::video::rtp::{VideoReceiver, add_video_track};
+use webrtc_engine::video::{Facing, Rotation, VideoConfig};
 
 use common::{align_windows, mean_correlation, test_signal};
 
@@ -344,6 +348,157 @@ async fn a_voice_crosses_a_loopback_call_through_the_whole_pipeline() {
 
         assert_heard("callee", &callee_heard, &voice(false), &callee_stats);
         assert_heard("caller", &caller_heard, &voice(true), &caller_stats);
+    })
+    .await
+    .expect("the call finishes within the limit");
+}
+
+/// Splits the remote tracks `on_track` hands over by kind: the first audio track goes to the
+/// first channel, the first video track to the second.
+type RemoteTrack = Arc<dyn TrackRemote>;
+
+fn by_kind(
+    mut tracks: mpsc::UnboundedReceiver<RemoteTrack>,
+) -> (
+    mpsc::UnboundedReceiver<RemoteTrack>,
+    oneshot::Receiver<RemoteTrack>,
+) {
+    let (audio, audio_tracks) = mpsc::unbounded_channel();
+    let (video, video_track) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut video = Some(video);
+        while let Some(track) = tracks.recv().await {
+            if track.kind().await == RtpCodecKind::Video {
+                if let Some(video) = video.take() {
+                    let _ = video.send(track);
+                }
+            } else {
+                let _ = audio.send(track);
+            }
+        }
+    });
+    (audio_tracks, video_track)
+}
+
+const VIDEO_CONFIG: VideoCallConfig = VideoCallConfig {
+    video: VideoConfig {
+        width: 320,
+        height: 240,
+        fps: 30,
+        bitrate_bps: 300_000,
+    },
+    facing: Facing::Front,
+    poll_interval: Duration::from_millis(5),
+};
+const VIDEO_FRAMES: usize = 30;
+
+// Opus and H.264 on one connection, as a video call carries them: the caller's camera crosses
+// real RTP (FU-A, STAP-A, CVO) to the callee's receiver while both sides talk, and a PLI from
+// the callee reaches the caller's camera through the RTCP feedback path.
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_and_video_share_a_loopback_call_and_a_pli_reaches_the_camera() {
+    timeout(CALL_LIMIT, async {
+        let caller = peer().await;
+        let caller_video = add_video_track(caller.connection.as_ref())
+            .await
+            .expect("the caller's video track");
+        let callee = peer().await;
+        let callee_video = add_video_track(callee.connection.as_ref())
+            .await
+            .expect("the callee's video track");
+        connect(&caller, &callee).await;
+        let (mut caller_audio, caller_video_track) = by_kind(caller.tracks);
+        let (mut callee_audio, callee_video_track) = by_kind(callee.tracks);
+
+        let camera = FakeSource::new().with_rotation(Rotation::Deg90);
+        let camera_probe = camera.probe();
+        let transport = VideoTransport {
+            feedback: caller_video.feedback(),
+            remote: VideoReceiver::pending(caller_video_track, &caller_video),
+            frames: caller_video,
+        };
+        let video_call = VideoCall::start(
+            Box::new(camera),
+            Box::new(FakeSink::new()),
+            transport,
+            VIDEO_CONFIG,
+        )
+        .expect("the video call starts");
+
+        let watch = async {
+            let mut receiver = VideoReceiver::pending(callee_video_track, &callee_video);
+            let mut frames = Vec::new();
+            while frames.len() < VIDEO_FRAMES {
+                let frame = timeout(STEP_LIMIT, receiver.recv())
+                    .await
+                    .expect("a frame in time")
+                    .expect("the track is readable")
+                    .expect("the track goes on");
+                frames.push(frame);
+            }
+            receiver
+                .request_keyframe()
+                .await
+                .expect("the PLI is written");
+            let keyframe = loop {
+                let frame = timeout(STEP_LIMIT, receiver.recv())
+                    .await
+                    .expect("a keyframe in time")
+                    .expect("the track is readable")
+                    .expect("the track goes on");
+                if frame.keyframe {
+                    break frame;
+                }
+            };
+            (frames, keyframe, receiver.stats())
+        };
+        let ((), (), (), (frames, keyframe, received)) = tokio::join!(
+            speak(&caller.sender),
+            speak(&callee.sender),
+            async {
+                listen(&mut callee_audio).await;
+                listen(&mut caller_audio).await;
+            },
+            watch,
+        );
+        let sent = video_call.stop().await;
+        caller
+            .connection
+            .close()
+            .await
+            .expect("the caller hangs up");
+        callee
+            .connection
+            .close()
+            .await
+            .expect("the callee hangs up");
+        eprintln!("sent {sent:?}\nreceived {received:?}");
+
+        assert!(frames[0].keyframe, "the first frame is a keyframe");
+        let first = frame_index(&frames[0].data).expect("a fake frame");
+        for (offset, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                frame_index(&frame.data),
+                Some(first + offset as u32),
+                "in order"
+            );
+            assert_eq!(frame.rotation, Rotation::Deg90, "CVO carries the rotation");
+        }
+        // The fake camera stamps real capture times, 1/30 s apart give or take the scheduler.
+        let span = frames[VIDEO_FRAMES - 1].timestamp - frames[0].timestamp;
+        let expected = Duration::from_secs(1) * (VIDEO_FRAMES as u32 - 1) / 30;
+        assert!(
+            span.abs_diff(expected) < expected / 5,
+            "90 kHz timestamps: {span:?} for {expected:?}"
+        );
+        assert!(frame_index(&keyframe.data) > frame_index(&frames[VIDEO_FRAMES - 1].data));
+        assert_eq!(received.dropped, 0);
+        assert!(
+            camera_probe.lock().expect("the probe").keyframe_requests >= 1,
+            "the PLI reached the camera"
+        );
+        assert!(sent.keyframe_requests_received >= 1, "{sent:?}");
+        assert_eq!(sent.send_errors, 0, "{sent:?}");
     })
     .await
     .expect("the call finishes within the limit");

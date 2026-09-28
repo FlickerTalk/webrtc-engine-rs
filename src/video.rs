@@ -46,6 +46,14 @@
 //! - **Software** — `video::openh264` (feature `openh264`): an H.264 encoder and decoder for tests
 //!   and the desktop.
 
+pub mod assemble;
+pub mod bitrate;
+pub mod call;
+pub mod fake;
+pub mod h264;
+pub mod packet;
+pub mod rtp;
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
