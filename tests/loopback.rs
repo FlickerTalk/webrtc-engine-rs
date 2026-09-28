@@ -4,13 +4,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodecParameters, RtpCodecKind};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use webrtc::media_stream::track_remote::TrackRemote;
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionEventHandler, RTCIceGatheringState, RTCPeerConnectionState,
+    MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCIceGatheringState, RTCPeerConnectionState,
 };
-use webrtc_engine::rtp::{AudioReceiver, AudioSender, add_audio_track, peer_connection_builder};
+use webrtc_engine::rtp::{
+    AudioReceiver, AudioSender, add_audio_track, opus_codec, peer_connection_builder,
+};
 
 /// Each wait gets this long; the whole call gets `CALL_LIMIT`, so the test can never hang.
 const STEP_LIMIT: Duration = Duration::from_secs(10);
@@ -53,6 +57,10 @@ struct Peer {
 }
 
 async fn peer() -> Peer {
+    peer_with(peer_connection_builder().expect("the builder is ready")).await
+}
+
+async fn peer_with(builder: PeerConnectionBuilder<String>) -> Peer {
     let (gathered_tx, gathered) = watch::channel(false);
     let (connected_tx, connected) = watch::channel(false);
     let (tracks_tx, tracks) = mpsc::unbounded_channel();
@@ -62,8 +70,7 @@ async fn peer() -> Peer {
         tracks: tracks_tx,
     };
     let connection: Arc<dyn PeerConnection> = Arc::new(
-        peer_connection_builder()
-            .expect("the builder is ready")
+        builder
             .with_handler(Arc::new(events))
             .with_udp_addrs(vec!["127.0.0.1:0".to_owned()])
             .build()
@@ -189,20 +196,16 @@ async fn listen(tracks: &mut mpsc::UnboundedReceiver<Arc<dyn TrackRemote>>) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn opus_packets_cross_a_loopback_call_in_order_both_ways() {
+/// Both sides speak and listen at once, then hang up.
+async fn call(mut caller: Peer, mut callee: Peer) {
     timeout(CALL_LIMIT, async {
-        let mut caller = peer().await;
-        let mut callee = peer().await;
         connect(&caller, &callee).await;
-
         tokio::join!(
             speak(&caller.sender),
             speak(&callee.sender),
             listen(&mut callee.tracks),
             listen(&mut caller.tracks),
         );
-
         caller
             .connection
             .close()
@@ -216,4 +219,27 @@ async fn opus_packets_cross_a_loopback_call_in_order_both_ways() {
     })
     .await
     .expect("the call finishes within the limit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opus_packets_cross_a_loopback_call_in_order_both_ways() {
+    call(peer().await, peer().await).await;
+}
+
+// Firefox offers Opus as payload type 109, not Chrome's 111. The answer keeps the offerer's
+// number, so our side has to send with 109 or its packets are refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn answering_an_offer_that_numbers_opus_differently_still_carries_audio() {
+    let mut engine = MediaEngine::default();
+    engine
+        .register_codec(
+            RTCRtpCodecParameters {
+                rtp_codec: opus_codec(),
+                payload_type: 109,
+            },
+            RtpCodecKind::Audio,
+        )
+        .expect("opus is registered as 109");
+    let caller = peer_with(PeerConnectionBuilder::new().with_media_engine(engine)).await;
+    call(caller, peer().await).await;
 }
