@@ -11,6 +11,9 @@ use ::openh264::encoder::{
 };
 use ::openh264::formats::YUVSource;
 use ::openh264::{OpenH264API, Timestamp};
+use openh264_sys2::{
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo, SPATIAL_LAYER_ALL,
+};
 
 use super::{EncodedFrame, Rotation, VideoConfig, VideoError, clamp_bitrate};
 
@@ -223,16 +226,23 @@ impl SoftwareEncoder {
         };
         let sized = self.encoder.insert(sized);
         let millis = u64::try_from(timestamp.as_millis()).unwrap_or(u64::MAX);
-        let stream = sized
+        let encoded = sized
             .encoder
             .encode_at(frame, Timestamp::from_millis(millis))
-            .map_err(backend)?;
-        let keyframe = match stream.frame_type() {
+            .map(|stream| (stream.frame_type(), stream.to_vec()));
+        let (frame_type, data) = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                // Start again from a fresh encoder: this one may not be initialised.
+                self.encoder = None;
+                return Err(backend(error));
+            }
+        };
+        let keyframe = match frame_type {
             FrameType::IDR | FrameType::I => true,
             FrameType::P | FrameType::IPMixed => false,
             FrameType::Skip | FrameType::Invalid => return Ok(None),
         };
-        let data = stream.to_vec();
         if data.is_empty() {
             return Ok(None);
         }
@@ -242,6 +252,21 @@ impl SoftwareEncoder {
             timestamp,
             rotation: Rotation::Deg0,
         }))
+    }
+
+    /// Changes the target bitrate, clamped with [`clamp_bitrate`], without a new keyframe.
+    pub fn set_bitrate(&mut self, bps: u32) {
+        self.bitrate_bps = clamp_bitrate(bps);
+        if let Some(sized) = &mut self.encoder {
+            // An encoder built later takes the bitrate from its config; a failure here leaves
+            // the old bitrate, which is still a working stream.
+            let _ = apply_bitrate(&mut sized.encoder, self.bitrate_bps);
+        }
+    }
+
+    /// The target bitrate, in bits per second.
+    pub fn bitrate(&self) -> u32 {
+        self.bitrate_bps
     }
 
     /// Makes the next encoded frame a keyframe, with its SPS and PPS.
@@ -274,6 +299,30 @@ impl YUVSource for I420Frame {
     fn v(&self) -> &[u8] {
         &self.v
     }
+}
+
+/// Sets a running encoder's bitrate: the ceiling first, since OpenH264 keeps the target under it.
+fn apply_bitrate(encoder: &mut Encoder, bps: u32) -> Result<(), VideoError> {
+    let bitrate = i32::try_from(bps).map_err(|_| VideoError::Unsupported)?;
+    for option in [ENCODER_OPTION_MAX_BITRATE, ENCODER_OPTION_BITRATE] {
+        let mut info = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_ALL,
+            iBitrate: bitrate,
+        };
+        // SAFETY: both options take a pointer to an `SBitrateInfo`, which lives across the call
+        // and which OpenH264 only reads. An encoder that is not initialised refuses the option.
+        let code = unsafe {
+            encoder
+                .raw_api()
+                .set_option(option, std::ptr::from_mut(&mut info).cast())
+        };
+        if code != 0 {
+            return Err(VideoError::Backend(format!(
+                "openh264: bitrate option failed ({code})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn backend(error: ::openh264::Error) -> VideoError {
@@ -400,6 +449,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!after.keyframe, "only one frame is forced");
+    }
+
+    /// Bytes a second of the frames from `from` to `to` (exclusive), at 30 fps.
+    fn encode_run(encoder: &mut SoftwareEncoder, from: u32, to: u32) -> (usize, Vec<bool>) {
+        let mut bytes = 0;
+        let mut keyframes = Vec::new();
+        for index in from..to {
+            let frame = encoder
+                .encode(&moving_pattern(320, 240, index), at(index))
+                .unwrap()
+                .unwrap();
+            bytes += frame.data.len();
+            keyframes.push(frame.keyframe);
+        }
+        (bytes * 30 / (to - from) as usize, keyframes)
+    }
+
+    #[test]
+    fn a_new_bitrate_changes_the_size_of_the_frames_without_a_keyframe() {
+        let mut encoder = encoder();
+        encoder.set_bitrate(150_000);
+        encoder.encode(&moving_pattern(320, 240, 0), at(0)).unwrap();
+        // Rate control needs a moment to settle; measure the second half of each run.
+        encode_run(&mut encoder, 1, 30);
+        let (low, _) = encode_run(&mut encoder, 30, 60);
+
+        encoder.set_bitrate(2_000_000);
+        assert_eq!(encoder.bitrate(), 2_000_000);
+        let (_, keyframes) = encode_run(&mut encoder, 60, 90);
+        assert!(keyframes.iter().all(|&keyframe| !keyframe));
+        let (high, _) = encode_run(&mut encoder, 90, 120);
+        eprintln!("{low} B/s at 150 kbit/s, {high} B/s at 2 Mbit/s");
+        assert!(
+            high > low * 3,
+            "{low} B/s at 150 kbit/s, {high} B/s at 2 Mbit/s"
+        );
+
+        encoder.set_bitrate(u32::MAX);
+        assert_eq!(encoder.bitrate(), crate::video::MAX_BITRATE_BPS);
     }
 
     fn flat_rgb(width: u32, height: u32, colour: [u8; 3]) -> Vec<u8> {
