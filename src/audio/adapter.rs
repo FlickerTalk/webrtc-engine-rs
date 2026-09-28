@@ -94,6 +94,11 @@ impl CaptureAdapter {
     pub fn dropped(&self) -> Counter {
         self.dropped.clone()
     }
+
+    /// Gives the ring back, for an adapter in another format when the device changes.
+    pub fn into_ring(self) -> RingProducer {
+        self.producer
+    }
 }
 
 /// Fills a playout callback's buffers from 48 kHz mono i16 samples in a ring.
@@ -150,6 +155,11 @@ impl PlayoutAdapter {
     /// How many callbacks ran out of samples and played silence.
     pub fn underruns(&self) -> Counter {
         self.underruns.clone()
+    }
+
+    /// Gives the ring back, for an adapter in another format when the device changes.
+    pub fn into_ring(self) -> RingConsumer {
+        self.consumer
     }
 }
 
@@ -246,6 +256,27 @@ mod tests {
         adapter.push(&[1i16; 11]);
         assert_eq!(dropped.get(), 3);
         assert_eq!(drain(&mut consumer).len(), 8);
+    }
+
+    #[test]
+    fn capture_gives_back_the_same_ring() {
+        let (producer, mut consumer) = ring(16);
+        let mut adapter = CaptureAdapter::new(stereo(SAMPLE_RATE), producer).unwrap();
+        adapter.push(&[100i16, 100]);
+        let mut producer = adapter.into_ring();
+        producer.push(&[200]);
+        assert_eq!(drain(&mut consumer), [100, 200]);
+    }
+
+    #[test]
+    fn playout_gives_back_the_same_ring_with_what_it_did_not_play() {
+        let (mut producer, consumer) = ring(16);
+        let mut adapter = PlayoutAdapter::new(ENGINE_MONO, consumer).unwrap();
+        producer.push(&[1, 2, 3]);
+        let mut played = [0i16; 1];
+        adapter.fill(&mut played);
+        let mut consumer = adapter.into_ring();
+        assert_eq!(drain(&mut consumer), [2, 3]);
     }
 
     #[test]
