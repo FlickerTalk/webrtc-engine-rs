@@ -12,7 +12,8 @@ use std::time::Duration;
 /// pipeline polls [`KeyframeRequests::take`] after each [`push`](crate::video::VideoSink::push)
 /// (or on a timer) and, when it returns `true`, sends the other side an RTCP PLI. Requests made
 /// between two polls collapse into one. The sink already spaces them out
-/// ([`KEYFRAME_RETRY`]), so the pipeline may send a PLI for every `true`.
+/// (at most one request every 500 ms of frame time while it waits), so the pipeline may send a
+/// PLI for every `true`.
 ///
 /// Cheap to clone; every clone sees the same flag.
 #[derive(Debug, Clone, Default)]
