@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use minifb::{Key, Window, WindowOptions};
 use nokhwa::pixel_format::YuyvFormat;
 use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
@@ -326,6 +327,61 @@ fn capture(
 
 fn camera_error(error: NokhwaError) -> VideoError {
     VideoError::Backend(format!("camera: {error}"))
+}
+
+/// A desktop window showing the remote video with the local preview in a corner.
+///
+/// **Main thread only.** On macOS, AppKit windows must be created and updated on the process'
+/// main thread, so the window is not `Send`: open it in `main` and call [`VideoWindow::show`]
+/// from `main`'s loop; the camera, the network and the decoder run elsewhere and hand over
+/// their pictures through [`FrameSlot`]s.
+pub struct VideoWindow {
+    window: Window,
+    canvas: Vec<u32>,
+}
+
+impl VideoWindow {
+    /// Opens a resizable window of `width × height` pixels.
+    pub fn open(title: &str, width: usize, height: usize) -> Result<Self, VideoError> {
+        let options = WindowOptions {
+            resize: true,
+            ..WindowOptions::default()
+        };
+        let mut window = Window::new(title, width, height, options)
+            .map_err(|error| VideoError::Backend(format!("window: {error}")))?;
+        window.set_target_fps(60);
+        Ok(Self {
+            window,
+            canvas: Vec::new(),
+        })
+    }
+
+    /// Draws the newest pictures and handles the window's events. `false` once the user has
+    /// closed the window or pressed Escape.
+    pub fn show(
+        &mut self,
+        remote: &FrameSlot,
+        preview: Option<&FrameSlot>,
+    ) -> Result<bool, VideoError> {
+        if !self.window.is_open() || self.window.is_key_down(Key::Escape) {
+            return Ok(false);
+        }
+        let (width, height) = self.window.get_size();
+        let (width, height) = (width.max(1), height.max(1));
+        self.canvas.resize(width * height, 0);
+        let preview = preview.and_then(FrameSlot::latest);
+        compose(
+            &mut self.canvas,
+            width,
+            height,
+            remote.latest().as_ref(),
+            preview.as_ref(),
+        );
+        self.window
+            .update_with_buffer(&self.canvas, width, height)
+            .map_err(|error| VideoError::Backend(format!("window: {error}")))?;
+        Ok(true)
+    }
 }
 
 /// Draws a window's contents into `canvas` (`width × height`, 0RGB): `remote` fitted to the
@@ -841,6 +897,29 @@ mod tests {
         }
         for row in &rows[12..] {
             assert_eq!(row, "............BBRR", "mirrored, as in a mirror");
+        }
+    }
+
+    /// Needs a screen and the main thread, which libtest does not give: on macOS AppKit refuses
+    /// the window, so there check it with the `video_demo` example instead.
+    #[test]
+    #[ignore = "needs a screen and the main thread"]
+    fn shows_the_test_pattern_in_a_window() {
+        let remote = FrameSlot::new();
+        let preview = FrameSlot::new();
+        let mut window = VideoWindow::open("webrtc-engine test", 640, 480).unwrap();
+        for index in 0..90 {
+            remote.publish(
+                I420Frame::test_pattern(640, 480, index).unwrap(),
+                Rotation::Deg0,
+            );
+            preview.publish(
+                I420Frame::test_pattern(320, 240, index).unwrap(),
+                Rotation::Deg0,
+            );
+            if !window.show(&remote, Some(&preview)).unwrap() {
+                break;
+            }
         }
     }
 
