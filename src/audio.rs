@@ -10,10 +10,16 @@
 //! A platform backend owns the callbacks and the adapters; the engine owns the frame ends.
 
 pub mod adapter;
+// The pure parts (format, callbacks) are tested on the host; `AaudioBackend` is Android only.
+#[cfg(any(target_os = "android", test))]
+pub mod android;
 #[cfg(feature = "desktop")]
 pub mod desktop;
 pub mod format;
 pub mod frames;
+// The format and buffer handling is plain Rust, so the host tests build it too.
+#[cfg(any(target_os = "ios", test))]
+pub mod ios;
 pub mod resample;
 pub mod ring;
 
@@ -96,6 +102,42 @@ pub trait AudioBackend {
     fn start(&mut self, io: DeviceIo) -> Result<(), AudioError>;
     /// Stops the devices and lets them go. Stopping a backend that is not running does nothing.
     fn stop(&mut self) -> Result<(), AudioError>;
+    /// Keeps the devices alive: call it about every 100 ms while the backend runs, from the
+    /// thread that owns it, never from an audio callback.
+    ///
+    /// Some platforms cannot recover from a device change inside their callbacks: on Android a
+    /// headset plugged in or out kills both streams, and only this call reopens them, so a
+    /// call nobody maintains goes silent. An error means the upkeep failed this time; the
+    /// backend keeps what it needs and the next call tries again. Backends with nothing to do
+    /// return `Ok(())`.
+    fn maintain(&mut self) -> Result<(), AudioError> {
+        Ok(())
+    }
+}
+
+/// The backend for the platform this is built for, created stopped: VoiceProcessingIO on iOS,
+/// AAudio on Android, `cpal` elsewhere with the `desktop` feature. Without any of them there
+/// is no device to open, and it returns [`AudioError::NoDevice`].
+pub fn platform_backend() -> Result<Box<dyn AudioBackend + Send>, AudioError> {
+    #[cfg(target_os = "ios")]
+    {
+        Ok(Box::new(ios::VoiceProcessingBackend::new()?))
+    }
+    #[cfg(target_os = "android")]
+    {
+        Ok(Box::new(android::AaudioBackend::new()?))
+    }
+    #[cfg(all(
+        feature = "desktop",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    {
+        Ok(Box::new(desktop::DesktopBackend::new()))
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", feature = "desktop")))]
+    {
+        Err(AudioError::NoDevice)
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +186,75 @@ mod tests {
             self.running = None;
             Ok(())
         }
+    }
+
+    /// A backend with upkeep to do, such as reopening a stream after a device went away.
+    struct UpkeepBackend {
+        maintained: Counter,
+    }
+
+    impl AudioBackend for UpkeepBackend {
+        fn start(&mut self, _io: DeviceIo) -> Result<(), AudioError> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), AudioError> {
+            Ok(())
+        }
+
+        fn maintain(&mut self) -> Result<(), AudioError> {
+            self.maintained.add(1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_backend_with_no_upkeep_maintains_as_a_no_op() {
+        let (device, mut engine) = audio_io(4);
+        let mut loopback = LoopbackBackend::default();
+        loopback.start(device).unwrap();
+
+        assert_eq!(loopback.maintain(), Ok(()));
+
+        assert!(engine.playout.write_frame(&numbered_frame(0)));
+        loopback.run_callbacks(FRAME_SAMPLES);
+        let mut frame = [0; FRAME_SAMPLES];
+        assert!(engine.capture.read_frame(&mut frame));
+        assert_eq!(frame, numbered_frame(0));
+    }
+
+    #[test]
+    fn maintain_reaches_the_backend_behind_a_boxed_trait_object() {
+        let maintained = Counter::default();
+        let mut backend: Box<dyn AudioBackend + Send> = Box::new(UpkeepBackend {
+            maintained: maintained.clone(),
+        });
+        let (device, _engine) = audio_io(4);
+        backend.start(device).unwrap();
+
+        for _ in 0..3 {
+            backend.maintain().unwrap();
+        }
+
+        assert_eq!(maintained.get(), 3);
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android", feature = "desktop")))]
+    #[test]
+    fn without_a_platform_backend_there_is_no_device() {
+        assert!(matches!(platform_backend(), Err(AudioError::NoDevice)));
+    }
+
+    #[cfg(all(
+        feature = "desktop",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn the_desktop_feature_gives_a_stopped_desktop_backend() {
+        // Nothing opens a device until `start`, so this runs without a microphone.
+        let mut backend = platform_backend().unwrap();
+        assert_eq!(backend.maintain(), Ok(()));
+        assert_eq!(backend.stop(), Ok(()));
     }
 
     #[test]
