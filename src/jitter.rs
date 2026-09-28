@@ -103,6 +103,8 @@ pub struct JitterBuffer {
     calm: usize,
     /// Consecutive playouts that left more packets than `target`.
     above: usize,
+    /// Playouts to hold back after the target grew mid-playout, so the depth can catch up.
+    holds: usize,
 }
 
 impl JitterBuffer {
@@ -119,6 +121,7 @@ impl JitterBuffer {
             desired: INITIAL_TARGET,
             calm: 0,
             above: 0,
+            holds: 0,
         }
     }
 
@@ -170,6 +173,9 @@ impl JitterBuffer {
             self.desired = desired_depth(self.estimate.jitter_ms);
             // Growing late costs audible gaps; growing early only costs a little delay.
             if self.desired > self.target {
+                if self.playing {
+                    self.holds += self.desired - self.target;
+                }
                 self.target = self.desired;
                 self.calm = 0;
             }
@@ -199,6 +205,7 @@ impl JitterBuffer {
         self.next = None;
         self.highest = None;
         self.playing = false;
+        self.holds = 0;
         self.estimate.last_transit_ms = None;
     }
 
@@ -250,6 +257,16 @@ impl JitterBuffer {
         let Some(next) = self.next else {
             return Playout::Waiting;
         };
+        // Only a buffer that runs dry refills to the target by itself; a steady but late stream
+        // never does, so the extra delay is added here, by holding the playout.
+        if self.holds > 0 {
+            if self.packets.len() >= self.target {
+                self.holds = 0;
+            } else {
+                self.holds -= 1;
+                return Playout::Waiting;
+            }
+        }
         if let Some(payload) = self.packets.remove(&next) {
             self.next = Some(next + 1);
             self.counts.played += 1;
@@ -258,6 +275,7 @@ impl JitterBuffer {
         if self.packets.is_empty() {
             // Keep `next`: the packet may still arrive, late but in time to be played.
             self.playing = false;
+            self.holds = 0;
             return Playout::Waiting;
         }
         self.next = Some(next + 1);
@@ -629,5 +647,37 @@ mod tests {
         assert_eq!(stats.depth, stats.target);
         assert_eq!(stats.discarded, 10);
         assert_eq!(stats.concealed, 0);
+    }
+
+    /// Drives the buffer like the engine does: every 20 ms, push what has arrived, then play.
+    fn run(buffer: &mut JitterBuffer, arrivals: &[(u16, Duration)], ticks: u64) -> Vec<Playout> {
+        let mut pending = arrivals.iter().peekable();
+        (0..ticks)
+            .map(|tick| {
+                let now = at(1000 + tick * 20);
+                while let Some(&&(sequence, arrival)) = pending.peek() {
+                    if arrival > now {
+                        break;
+                    }
+                    buffer.push_at(sequence, vec![], arrival);
+                    pending.next();
+                }
+                buffer.playout()
+            })
+            .collect()
+    }
+
+    // Growing the target must also grow the delay, even if the buffer never runs dry: otherwise
+    // every delayed packet keeps arriving just after its turn was concealed.
+    #[test]
+    fn stops_concealing_once_the_depth_has_grown() {
+        let mut buffer = JitterBuffer::new();
+        let arrivals = every_other_delayed(0..500, 60);
+        let playouts = run(&mut buffer, &arrivals, 520);
+        let missing_after_first_second = playouts[50..]
+            .iter()
+            .filter(|playout| **playout == Playout::Missing)
+            .count();
+        assert_eq!(missing_after_first_second, 0);
     }
 }
