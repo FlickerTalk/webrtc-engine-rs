@@ -118,18 +118,28 @@ impl I420Frame {
         self.to_packed(4)
     }
 
+    /// The colour of one pixel as 8-bit RGB; `None` outside the picture.
+    pub fn rgb_at(&self, x: u32, y: u32) -> Option<[u8; 3]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let (x, y, width) = (x as usize, y as usize, self.width as usize);
+        let chroma_at = (y / 2) * (width / 2) + x / 2;
+        let c = 298 * (i32::from(self.y[y * width + x]) - 16);
+        let d = i32::from(self.u[chroma_at]) - 128;
+        let e = i32::from(self.v[chroma_at]) - 128;
+        Some([
+            clamp_u8((c + 409 * e + 128) >> 8),
+            clamp_u8((c - 100 * d - 208 * e + 128) >> 8),
+            clamp_u8((c + 516 * d + 128) >> 8),
+        ])
+    }
+
     fn to_packed(&self, bytes_per_pixel: usize) -> Vec<u8> {
-        let (width, height) = (self.width as usize, self.height as usize);
-        let mut out = Vec::with_capacity(width * height * bytes_per_pixel);
-        for row in 0..height {
-            for column in 0..width {
-                let chroma_at = (row / 2) * (width / 2) + column / 2;
-                let c = 298 * (i32::from(self.y[row * width + column]) - 16);
-                let d = i32::from(self.u[chroma_at]) - 128;
-                let e = i32::from(self.v[chroma_at]) - 128;
-                out.push(clamp_u8((c + 409 * e + 128) >> 8));
-                out.push(clamp_u8((c - 100 * d - 208 * e + 128) >> 8));
-                out.push(clamp_u8((c + 516 * d + 128) >> 8));
+        let mut out = Vec::with_capacity(self.y.len() * bytes_per_pixel);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                out.extend_from_slice(&self.rgb_at(x, y).unwrap_or_default());
                 if bytes_per_pixel == 4 {
                     out.push(u8::MAX);
                 }
@@ -696,6 +706,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn one_pixel_converts_as_the_whole_picture_does() {
+        let frame = I420Frame::test_pattern(64, 48, 3).unwrap();
+        let rgb = frame.to_rgb();
+        for y in 0..48 {
+            for x in 0..64 {
+                let at = ((y * 64 + x) * 3) as usize;
+                assert_eq!(
+                    frame.rgb_at(x, y),
+                    Some([rgb[at], rgb[at + 1], rgb[at + 2]])
+                );
+            }
+        }
+        assert_eq!(frame.rgb_at(64, 0), None);
+        assert_eq!(frame.rgb_at(0, 48), None);
     }
 
     #[test]
