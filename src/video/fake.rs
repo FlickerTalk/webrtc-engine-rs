@@ -46,8 +46,9 @@ fn index_bytes(index: u32) -> [u8; INDEX_BYTES] {
     std::array::from_fn(|byte| 0x80 | ((index >> (7 * (INDEX_BYTES - 1 - byte))) & 0x7F) as u8)
 }
 
-/// A fake access unit of about `size` bytes (three times that for a keyframe).
-fn make_frame(index: u32, keyframe: bool, size: usize) -> Vec<u8> {
+/// A fake access unit numbered `index`, of about `size` bytes (three times that for a
+/// keyframe, which carries an SPS and a PPS too).
+pub fn frame_data(index: u32, keyframe: bool, size: usize) -> Vec<u8> {
     const START_CODE: [u8; 4] = [0, 0, 0, 1];
     let mut data = Vec::with_capacity(size * 3);
     let size = if keyframe {
@@ -173,7 +174,7 @@ impl VideoSource for FakeSource {
                 };
                 let size = (bitrate as usize / 8 / fps).max(16);
                 let frame = EncodedFrame {
-                    data: make_frame(index, keyframe, size),
+                    data: frame_data(index, keyframe, size),
                     keyframe,
                     timestamp: epoch.elapsed(),
                     rotation,
