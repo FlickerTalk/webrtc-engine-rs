@@ -663,7 +663,9 @@ pub fn yuyv_to_i420(
     let (mut u, mut v) = (Vec::with_capacity(chroma), Vec::with_capacity(chroma));
     for index in (0..rows).step_by(2) {
         let (top, bottom) = (row(index), row(index + 1));
-        for (a, b) in top.chunks_exact(4).zip(bottom.chunks_exact(4)) {
+        // With an odd width the last half pair is left out (and from_planes refuses the size).
+        let (top, bottom) = (top.as_chunks::<4>().0, bottom.as_chunks::<4>().0);
+        for (a, b) in top.iter().zip(bottom) {
             let average = |i: usize| (u16::from(a[i]) + u16::from(b[i])).div_ceil(2) as u8;
             u.push(average(1));
             v.push(average(3));
@@ -1056,6 +1058,15 @@ mod tests {
         );
         assert_eq!(
             yuyv_to_i420(4, 2, 6, &[0; 16]),
+            Err(VideoError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn an_odd_width_is_rejected_without_reading_past_the_row() {
+        // 3×2: each row ends in half a pixel pair, left out of the chroma.
+        assert_eq!(
+            yuyv_to_i420(3, 2, 6, &[0; 12]),
             Err(VideoError::Unsupported)
         );
     }
