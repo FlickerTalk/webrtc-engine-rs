@@ -6,5 +6,55 @@ license = "AGPL-3.0-only"
 description = "Media engine for WebRTC calls on top of webrtc-rs: platform voice processing, Opus and a jitter buffer"
 repository = "https://github.com/FlickerTalk/webrtc-engine-rs"
 
-
 [dependencies]
+bytes = "1"
+cpal = { version = "0.18", optional = true }
+# Cisco's OpenH264 (BSD-2-Clause), compiled from source with `cc`: no cmake, no nasm on arm64.
+openh264 = { version = "0.9.8", optional = true }
+# Only for the encoder options the safe wrapper does not expose (the bitrate while running).
+openh264-sys2 = { version = "0.9.8", optional = true }
+# Desktop camera (AVFoundation on macOS) and window, for trying video on a computer.
+nokhwa = { version = "0.10.11", optional = true, default-features = false, features = ["input-avfoundation"] }
+minifb = { version = "0.28", optional = true }
+rand = "0.10"
+rtc = "0.21"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+webrtc = "0.21"
+
+# dlopen/dlsym for the NDK libraries loaded at run time (AAudio, Camera2, MediaCodec), so the
+# library still loads on Android 7 (API 24).
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
+
+# iOS video (`video::ios`): the Objective-C runtime for AVFoundation and Core Animation. The C
+# frameworks (CoreMedia, CoreVideo, VideoToolbox) are declared by hand in `video/ios/ffi.rs`.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[build-dependencies]
+cc = "1.5.1"
+
+[features]
+# The desktop backend (cpal), for trying the engine on a computer. Mobile builds leave it out.
+desktop = ["dep:cpal", "openh264", "dep:nokhwa", "dep:minifb"]
+# Software H.264 (Constrained Baseline) encoder and decoder, for tests and the desktop.
+openh264 = ["dep:openh264", "dep:openh264-sys2"]
+
+[[example]]
+name = "mic_echo"
+required-features = ["desktop"]
+test = true
+
+[[example]]
+name = "call_demo"
+required-features = ["desktop"]
+test = true
+
+[[example]]
+name = "video_demo"
+required-features = ["desktop"]
+test = true
