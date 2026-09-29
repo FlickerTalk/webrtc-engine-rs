@@ -469,12 +469,14 @@ fn lens_facing(value: u8) -> Option<Facing> {
 /// The output sizes for `format` in `ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS`
 /// (`format, width, height, is_input` quadruples).
 fn output_sizes(configurations: &[i32], format: i32) -> Vec<(u32, u32)> {
-    configurations
-        .chunks_exact(4)
-        .filter(|entry| entry[0] == format && entry[3] == 0)
-        .filter_map(|entry| {
-            let width = u32::try_from(entry[1]).ok().filter(|&w| w > 0)?;
-            let height = u32::try_from(entry[2]).ok().filter(|&h| h > 0)?;
+    // A truncated entry at the end is left out.
+    let (entries, _) = configurations.as_chunks::<4>();
+    entries
+        .iter()
+        .filter(|&&[entry_format, _, _, is_input]| entry_format == format && is_input == 0)
+        .filter_map(|&[_, width, height, _]| {
+            let width = u32::try_from(width).ok().filter(|&w| w > 0)?;
+            let height = u32::try_from(height).ok().filter(|&h| h > 0)?;
             Some((width, height))
         })
         .collect()
@@ -520,15 +522,14 @@ fn choose_size(sizes: &[(u32, u32)], wanted: (u32, u32)) -> Option<(u32, u32)> {
 fn choose_fps_range(ranges: &[i32], fps: u32) -> Option<[i32; 2]> {
     let fps = i64::from(fps);
     let floor = fps.min(15);
-    ranges
-        .chunks_exact(2)
-        .map(|range| [range[0], range[1]])
-        .min_by_key(|&[min, max]| {
-            // Some legacy HALs give the rates in thousandths.
-            let scale = if max > 1000 { 1000 } else { 1 };
-            let (min, max) = (i64::from(min / scale), i64::from(max / scale));
-            (max - fps).abs() * 100 + (min - floor).abs()
-        })
+    // A lone value at the end is left out.
+    let (ranges, _) = ranges.as_chunks::<2>();
+    ranges.iter().copied().min_by_key(|&[min, max]| {
+        // Some legacy HALs give the rates in thousandths.
+        let scale = if max > 1000 { 1000 } else { 1 };
+        let (min, max) = (i64::from(min / scale), i64::from(max / scale));
+        (max - fps).abs() * 100 + (min - floor).abs()
+    })
 }
 
 /// A `camera_status_t` error as a [`VideoError`].
@@ -3017,6 +3018,12 @@ mod tests {
         assert_eq!(choose_fps_range(&[7, 30, 30, 30], 30), Some([7, 30]));
         assert_eq!(choose_fps_range(&ranges, 15), Some([15, 15]));
         assert_eq!(choose_fps_range(&[], 30), None);
+    }
+
+    #[test]
+    fn a_trailing_half_range_is_ignored() {
+        assert_eq!(choose_fps_range(&[15, 30, 60], 30), Some([15, 30]));
+        assert_eq!(choose_fps_range(&[30], 30), None);
     }
 
     #[test]
