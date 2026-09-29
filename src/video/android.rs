@@ -6,11 +6,14 @@
 //! The camera writes straight into the H.264 encoder's input surface
 //! (`AMediaCodec_createInputSurface`): no pixel ever passes through the CPU. The encoder is
 //! asked for Baseline at level 3.1, CBR (VBR, then no profile, if refused), a keyframe every two
-//! seconds and real-time priority. A drain thread takes each output buffer, keeps the SPS and PPS
-//! of the codec-config buffer and puts them in front of every keyframe (MediaCodec already emits
-//! Annex-B; AVCC would be converted), and pushes an [`EncodedFrame`] into the
-//! [`FrameSender`](super::FrameSender), with the rotation from the sensor orientation, the
-//! facing and the app's screen rotation. Pixels are neither rotated nor mirrored.
+//! seconds and real-time priority; each of those is tried with and then without
+//! `prepend-sps-pps-to-idr-frames`, which the software encoder refuses. A drain thread takes
+//! each output buffer, keeps the SPS and PPS of the codec-config buffer and puts them in front
+//! of every keyframe that lacks them (MediaCodec already emits Annex-B; AVCC would be
+//! converted), so the stream is the same with or without that key. It pushes an
+//! [`EncodedFrame`] into the [`FrameSender`](super::FrameSender), with the rotation from the
+//! sensor orientation, the facing and the app's screen rotation. Pixels are neither rotated nor
+//! mirrored.
 //! `set_bitrate` and `request_keyframe` go through `AMediaCodec_setParameters`
 //! (`video-bitrate`, `request-sync`); the drain thread also asks for a keyframe when the channel
 //! needs one. A camera switch keeps the encoder when the new camera can capture at its size
@@ -47,6 +50,15 @@
 //!   (`setOutputSurface`); on API 24–25 a surface change rebuilds it at the next keyframe.
 //! - `prepend-sps-pps-to-idr-frames` (API 29) and `low-latency` (API 30) are asked for and
 //!   ignored before.
+//!
+//! # Profile in the SPS
+//!
+//! The SDP announces Constrained Baseline (`42e01f`), but some hardware encoders (MediaTek)
+//! write a plain Baseline SPS, `42 00 1f`, without `constraint_set1`. The SPS is sent as the
+//! encoder wrote it: libwebrtc does the same (its `SpsVuiRewriter` rewrites only the VUI) and
+//! decoders do not compare the SPS with the SDP. Setting the flag would claim constraints (no
+//! FMO, ASO or redundant slices) the engine cannot check. If a peer ever refuses such a stream,
+//! the clean fix is asking for `AVCProfileConstrainedBaseline` (API 27) first.
 //!
 //! # The app's side (Kotlin)
 //!
@@ -586,7 +598,11 @@ const I_FRAME_INTERVAL_SECONDS: i32 = 2;
 
 /// The encoder formats to try, best first: CBR (the rate the network allows, not more), then
 /// VBR for encoders that refuse CBR, then without profile and level for encoders that refuse
-/// those. Input from a surface; `width`×`height` is the capture size.
+/// those. Each one is tried with `prepend-sps-pps-to-idr-frames` and then without it: the
+/// software encoder (`c2.android.avc.encoder`) and some vendor ones refuse the key and fail
+/// the whole configure. The key only saves work, since [`AccessUnitPackager`] puts the SPS and
+/// PPS in front of every keyframe anyway, so it goes before CBR or the profile. Input from a
+/// surface; `width`×`height` is the capture size.
 fn encoder_formats(width: u32, height: u32, config: &VideoConfig) -> Vec<Vec<FormatEntry>> {
     let int = |value: u32| FormatValue::Int(i32::try_from(value).unwrap_or(i32::MAX));
     let base = vec![
@@ -602,11 +618,13 @@ fn encoder_formats(width: u32, height: u32, config: &VideoConfig) -> Vec<Vec<For
         ),
         // 0 = real time.
         (KEY_PRIORITY, FormatValue::Int(0)),
-        // Android 10+; older encoders ignore it, and the packager adds them anyway.
-        (KEY_PREPEND_HEADER_TO_SYNC_FRAMES, FormatValue::Int(1)),
     ];
-    let with = |mode: i32, profile: bool| {
+    let with = |mode: i32, profile: bool, prepend: bool| {
         let mut format = base.clone();
+        if prepend {
+            // Android 10+; older encoders ignore it.
+            format.push((KEY_PREPEND_HEADER_TO_SYNC_FRAMES, FormatValue::Int(1)));
+        }
         format.push((KEY_BITRATE_MODE, FormatValue::Int(mode)));
         if profile {
             format.push((KEY_PROFILE, FormatValue::Int(AVC_PROFILE_BASELINE)));
@@ -614,11 +632,14 @@ fn encoder_formats(width: u32, height: u32, config: &VideoConfig) -> Vec<Vec<For
         }
         format
     };
-    vec![
-        with(BITRATE_MODE_CBR, true),
-        with(BITRATE_MODE_VBR, true),
-        with(BITRATE_MODE_VBR, false),
+    [
+        (BITRATE_MODE_CBR, true),
+        (BITRATE_MODE_VBR, true),
+        (BITRATE_MODE_VBR, false),
     ]
+    .into_iter()
+    .flat_map(|(mode, profile)| [with(mode, profile, true), with(mode, profile, false)])
+    .collect()
 }
 
 /// The decoder format for `params`: `csd-0` and `csd-1` hold the SPS and PPS in Annex-B, and
@@ -2696,6 +2717,38 @@ mod tests {
         );
     }
 
+    // An encoder that refuses `prepend-sps-pps-to-idr-frames` (the software one,
+    // `c2.android.avc.encoder`) only gives them in its codec-config buffer; one that honours it
+    // gives them again in every keyframe. The peer must get the same stream from both.
+    #[test]
+    fn the_stream_is_the_same_whether_or_not_the_encoder_prepends_the_parameter_sets() {
+        let stream = |prepends: bool| {
+            let idr = if prepends {
+                annex_b(&[&SPS, &PPS, &IDR])
+            } else {
+                annex_b(&[&IDR])
+            };
+            let buffers = [
+                (annex_b(&[&SPS, &PPS]), BUFFER_FLAG_CODEC_CONFIG),
+                (idr.clone(), BUFFER_FLAG_KEY_FRAME),
+                (annex_b(&[&DELTA]), 0),
+                // A keyframe asked for (`request-sync`).
+                (idr, BUFFER_FLAG_KEY_FRAME),
+                (annex_b(&[&DELTA]), 0),
+            ];
+            let mut packager = AccessUnitPackager::default();
+            buffers
+                .iter()
+                .filter_map(|(data, flags)| packager.package(data, *flags))
+                .collect::<Vec<_>>()
+        };
+        let keyframe = (annex_b(&[&SPS, &PPS, &IDR]), true);
+        let delta = (annex_b(&[&DELTA]), false);
+        let expected = vec![keyframe.clone(), delta.clone(), keyframe, delta];
+        assert_eq!(stream(false), expected);
+        assert_eq!(stream(true), expected);
+    }
+
     #[test]
     fn a_new_codec_config_replaces_the_old_one() {
         let mut packager = AccessUnitPackager::default();
@@ -3043,7 +3096,6 @@ mod tests {
     fn the_encoder_is_asked_for_real_time_baseline_h264_from_a_surface() {
         let config = VideoConfig::default();
         let formats = encoder_formats(640, 480, &config);
-        assert_eq!(formats.len(), 3);
         assert_eq!(
             formats[0],
             [
@@ -3061,16 +3113,50 @@ mod tests {
                 (KEY_LEVEL, FormatValue::Int(AVC_LEVEL_31)),
             ]
         );
-        let mode = |format: &[FormatEntry]| {
-            format
-                .iter()
-                .find(|(key, _)| *key == KEY_BITRATE_MODE)
-                .map(|(_, value)| value.clone())
-        };
-        assert_eq!(mode(&formats[1]), Some(FormatValue::Int(BITRATE_MODE_VBR)));
-        assert_eq!(formats[1].len(), formats[0].len());
-        assert!(!formats[2].iter().any(|(key, _)| *key == KEY_PROFILE));
-        assert!(!formats[2].iter().any(|(key, _)| *key == KEY_LEVEL));
+    }
+
+    // The software encoder (`c2.android.avc.encoder`, the emulator's and that of phones without
+    // a hardware one) refuses `prepend-sps-pps-to-idr-frames`: configure fails with BAD_VALUE.
+    // Each format is tried with it, then without it, before giving up CBR or the profile.
+    #[test]
+    fn the_encoder_formats_go_from_best_to_most_compatible() {
+        let formats = encoder_formats(640, 480, &VideoConfig::default());
+        let has =
+            |format: &[FormatEntry], wanted: &CStr| format.iter().any(|(key, _)| *key == wanted);
+        let summary: Vec<(Option<FormatValue>, bool, bool)> = formats
+            .iter()
+            .map(|format| {
+                let mode = format
+                    .iter()
+                    .find(|(key, _)| *key == KEY_BITRATE_MODE)
+                    .map(|(_, value)| value.clone());
+                assert_eq!(has(format, KEY_PROFILE), has(format, KEY_LEVEL));
+                (
+                    mode,
+                    has(format, KEY_PROFILE),
+                    has(format, KEY_PREPEND_HEADER_TO_SYNC_FRAMES),
+                )
+            })
+            .collect();
+        let cbr = Some(FormatValue::Int(BITRATE_MODE_CBR));
+        let vbr = Some(FormatValue::Int(BITRATE_MODE_VBR));
+        assert_eq!(
+            summary,
+            [
+                (cbr.clone(), true, true),
+                (cbr, true, false),
+                (vbr.clone(), true, true),
+                (vbr.clone(), true, false),
+                (vbr.clone(), false, true),
+                (vbr, false, false),
+            ]
+        );
+        // Apart from that key, each pair is the same format.
+        for pair in formats.chunks(2) {
+            let mut without = pair[0].clone();
+            without.retain(|(key, _)| *key != KEY_PREPEND_HEADER_TO_SYNC_FRAMES);
+            assert_eq!(without, pair[1]);
+        }
     }
 
     #[test]
