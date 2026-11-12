@@ -1,0 +1,54 @@
+[package]
+name = "webrtc-engine"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Media engine for WebRTC calls on top of webrtc-rs: platform voice processing, Opus and a jitter buffer"
+repository = "https://github.com/FlickerTalk/webrtc-engine-rs"
+
+[dependencies]
+bytes = "1"
+cpal = { version = "0.18", optional = true }
+openh264 = { version = "0.9.8", optional = true }
+# Only for changing the bitrate while running, which the safe wrapper does not expose.
+openh264-sys2 = { version = "0.9.8", optional = true }
+nokhwa = { version = "0.10.11", optional = true, default-features = false, features = ["input-avfoundation"] }
+minifb = { version = "0.28", optional = true }
+rand = "0.10"
+rtc = "0.21"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+webrtc = "0.21"
+
+# dlopen for AAudio, Camera2 and MediaCodec, so the library still loads on Android 7 (API 24).
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[build-dependencies]
+cc = "1.5.1"
+
+[features]
+# Leave it off for mobile builds.
+desktop = ["dep:cpal", "openh264", "dep:nokhwa", "dep:minifb"]
+openh264 = ["dep:openh264", "dep:openh264-sys2"]
+
+[[example]]
+name = "mic_echo"
+required-features = ["desktop"]
+test = true
+
+[[example]]
+name = "call_demo"
+required-features = ["desktop"]
+test = true
+
+[[example]]
+name = "video_demo"
+required-features = ["desktop"]
+test = true
