@@ -83,11 +83,28 @@ network with a fake device and clock (clean, and 10 % loss with 40 ms jitter), a
 audio and video on the same connection. `tests/video_pipeline.rs` runs two video calls against
 each other over the simulator (clean, and with loss and reordering). Tests that need a
 microphone, a camera or a window are `#[ignore]`; the iOS and Android backends have more that
-run in the simulator or on a device.
+run in the simulator or on a device (see [Cross builds](#cross-builds)).
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+```
+
+The ignored desktop tests are run by hand. On macOS the terminal needs the microphone and camera
+permissions:
+
+```sh
+cargo test --features desktop --lib -- --ignored audio::desktop   # a microphone and a speaker
+cargo test --features desktop --lib -- --ignored captures_encoded_frames_from_the_camera
+```
+
+The window test needs a screen and the main thread, which libtest does not give it: on macOS
+AppKit refuses the window, so check the window there with the video demo instead.
+
+Cargo does not run the tests in `build.rs`. After a build, run them with:
+
+```sh
+rustc --edition 2024 --test build.rs -o target/build-rs-tests --extern cc=$(ls target/debug/deps/libcc-*.rlib) -L target/debug/deps && target/build-rs-tests
 ```
 
 ## Hear it: the call demo
@@ -144,9 +161,21 @@ cargo build --target aarch64-linux-android
 
 Leave the `desktop` feature off for phones. The Android device tests are `#[ignore]`: build them
 with `cargo test --target aarch64-linux-android --lib --no-run`, push the test binary to
-`/data/local/tmp` and run it there with `--ignored audio::android` or `--ignored video::android`.
+`/data/local/tmp` and run it there from `adb shell` with `--ignored audio::android`, or
+`--ignored video::android --test-threads=1`. For the video ones:
+
+- From `adb shell` the camera may be refused; the camera test then checks the permission path.
+- A bare test binary has no Binder threads, which an app always has. Without them the camera
+  cannot dequeue buffers from a surface whose queue lives in the same process: it blocks, and
+  closing the camera then times out. The device tests start them first.
+- Hardware decoders may write a tiled layout (MediaTek ones do) that a CPU read of an
+  `ImageReader` sees scrambled, so the tests compare the shares of bright and dark luma, not the
+  pixels.
+
 The iOS ones run in the simulator: `cargo test --target aarch64-apple-ios-sim --lib --no-run`,
-then `xcrun simctl spawn booted <test binary> --ignored video::ios`.
+then `xcrun simctl spawn booted <test binary> --ignored video::ios` or `--ignored audio::ios`.
+The audio ones need the real VoiceProcessingIO unit; in the simulator it captures from the Mac's
+microphone.
 
 ## Licence
 
