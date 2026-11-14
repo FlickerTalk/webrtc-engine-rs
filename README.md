@@ -90,6 +90,12 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+Before opening a pull request, run `scripts/quality-check.sh`. It checks only the Rust files your
+branch changes: each must be formatted with `cargo fmt`, no function may run over 100 lines or nest
+blocks more than 5 deep, and a file outside `tests/` may not pass 500 lines, nor grow if it already
+has more. Function length and nesting are checked on the host build, so code built only for iOS or
+Android is not checked for them.
+
 The ignored desktop tests are run by hand. On macOS the terminal needs the microphone and camera
 permissions:
 
