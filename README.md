@@ -32,7 +32,7 @@ every 100 ms: on Android that reopens the streams after a headset is plugged in 
 without it the call goes silent.
 
 Video, working end to end in tests and on the desktop; the phone backends run in the iOS
-simulator and on an Android tablet, not yet in the app:
+simulator and on an Android tablet:
 
 - H.264 Constrained Baseline (`42e01f`, packetization mode 1) next to Opus on the same
   webrtc-rs connection, with NACK, receive-side transport-cc and the orientation extension
@@ -48,7 +48,8 @@ simulator and on an Android tablet, not yet in the app:
 - not there yet: retransmissions on their own stream (RTX), pacing and a send-side bandwidth
   estimate from transport-cc; checks against real browsers.
 
-Not there yet: the integration into the FlickerTalk app.
+The FlickerTalk app uses this crate, pinned to a commit, for the voice and video of its calls on
+iOS and Android; on the desktop its calls still go through the WebView's WebRTC.
 
 ## Modules
 
